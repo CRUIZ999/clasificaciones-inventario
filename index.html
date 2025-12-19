@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="es-MX">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Maestro Inventarios | El Cedro</title>
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- SheetJS (XLSX) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- Chart.js -->
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <script defer src="app.js"></script>
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">EC</div>
+      <div>
+        <div class="title">Maestro Inventarios</div>
+        <div class="subtitle">Carga tu archivo (XLSX/CSV) y analiza por sucursal</div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <label class="upload">
+        <input id="fileInput" type="file" accept=".xlsx,.xls,.csv" />
+        <span>📤 Cargar archivo</span>
+      </label>
+      <button id="btnClear" class="btn secondary" disabled>Limpiar</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="status" class="card status">
+      <div class="status-left">
+        <div class="status-title">Estado</div>
+        <div id="statusMsg" class="status-msg">Carga un archivo para comenzar.</div>
+        <div id="statusMeta" class="status-meta"></div>
+      </div>
+      <div class="status-right">
+        <div class="pill" id="pillPrivacy">✅ Procesamiento local (no se sube a internet)</div>
+      </div>
+    </section>
+
+    <section class="card tabs">
+      <button id="tabSummary" class="tab active" disabled>Resumen General</button>
+      <button id="tabDetail" class="tab" disabled>Detalle por Sucursal</button>
+      <div class="tab-note">Clic para cambiar de vista</div>
+    </section>
+
+    <!-- ================== RESUMEN GENERAL ================== -->
+    <section id="summaryView" class="view">
+      <section class="card kpis">
+        <div class="card-header">
+          <h2>Foto General</h2>
+          <div class="hint">Umbrales: Riesgo &lt; 15 días • Sobreinventario &gt; 60 días</div>
+        </div>
+
+        <div class="kpi-grid kpi-grid-4">
+          <div class="kpi">
+            <div class="kpi-label">Meses usados</div>
+            <div class="kpi-value" id="gMeses">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">SKUs únicos</div>
+            <div class="kpi-value" id="gSkus">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Inventario total (piezas)</div>
+            <div class="kpi-value" id="gInv">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Cobertura global (días)</div>
+            <div class="kpi-value" id="gCobDias">—</div>
+          </div>
+        </div>
+
+        <div class="kpi-grid kpi-grid-4 mt12">
+          <div class="kpi">
+            <div class="kpi-label">Prom. venta mensual total</div>
+            <div class="kpi-value" id="gPromMes">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">% SKUs Riesgo (&lt;15 días)</div>
+            <div class="kpi-value" id="gRiskPct">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">% SKUs Sobreinv (&gt;60 días)</div>
+            <div class="kpi-value" id="gOverPct">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Sin Mov con inventario</div>
+            <div class="kpi-value" id="gSinMovInv">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid2">
+        <section class="card chart-card">
+          <div class="card-header">
+            <h2>Clasificación por sucursal (100% apilado)</h2>
+            <div class="hint">A / B / C / Sin Mov por porcentaje</div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chartStacked"></canvas>
+          </div>
+        </section>
+
+        <section class="card chart-card">
+          <div class="card-header">
+            <h2>Riesgo & Sobreinventario por sucursal</h2>
+            <div class="hint">&lt;15 días y &gt;60 días</div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chartRiskOver"></canvas>
+          </div>
+        </section>
+      </section>
+
+      <section class="card table-card">
+        <div class="card-header">
+          <h2>Matriz ejecutiva por sucursal</h2>
+          <div class="hint">Conteo y % por clasificación + inventario y cobertura (mediana)</div>
+        </div>
+        <div class="table-wrap">
+          <table id="heatTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="grid2">
+        <section class="card">
+          <div class="card-header">
+            <h2>Rankings</h2>
+            <div class="hint">Basados en % SKUs (conteo) y piezas (inventario)</div>
+          </div>
+
+          <div class="rank-grid">
+            <div class="rank">
+              <div class="rank-title">Top Riesgo (&lt;15 días)</div>
+              <ol id="rankRisk" class="rank-list"></ol>
+            </div>
+            <div class="rank">
+              <div class="rank-title">Top Sobreinventario (&gt;60 días)</div>
+              <ol id="rankOver" class="rank-list"></ol>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-header">
+            <h2>Hallazgos automáticos</h2>
+            <div class="hint">Texto listo para dirección</div>
+          </div>
+          <ul id="insights" class="insights"></ul>
+        </section>
+      </section>
+    </section>
+
+    <!-- ================== DETALLE POR SUCURSAL ================== -->
+    <section id="detailView" class="view hidden">
+      <section class="grid">
+        <section class="card filters">
+          <div class="card-header">
+            <h2>Filtros</h2>
+            <div class="hint">Clic en encabezados para ordenar</div>
+          </div>
+
+          <div class="form">
+            <div class="field">
+              <label>Sucursal</label>
+              <select id="warehouseSelect" disabled></select>
+            </div>
+
+            <div class="field">
+              <label>Clasificación</label>
+              <select id="classSelect" disabled>
+                <option value="ALL">Todas</option>
+                <option value="A">A</option>
+                <option value="B">B</option>
+                <option value="C">C</option>
+                <option value="Sin Mov">Sin Mov</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label>Búsqueda (Código o Descripción)</label>
+              <input id="searchInput" type="text" placeholder="Ej. 750123... o BARNIZ..." disabled />
+            </div>
+
+            <div class="field">
+              <label>Solo inventario &gt; 0</label>
+              <label class="switch">
+                <input id="onlyInvToggle" type="checkbox" disabled />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="field">
+              <label>Rango Cobertura (Días)</label>
+              <div class="range">
+                <input id="covMin" type="number" placeholder="Mín" disabled />
+                <input id="covMax" type="number" placeholder="Máx" disabled />
+              </div>
+              <div class="hint2">Deja vacío para no filtrar</div>
+            </div>
+
+            <div class="field">
+              <label>Atajos</label>
+              <div class="chips">
+                <label class="chip">
+                  <input id="onlySinMovInv" type="checkbox" disabled />
+                  <span>Sin Mov con inventario</span>
+                </label>
+                <label class="chip">
+                  <input id="onlyABZero" type="checkbox" disabled />
+                  <span>A/B con inventario 0</span>
+                </label>
+              </div>
+            </div>
+
+            <button id="btnExport" class="btn" disabled>⬇️ Exportar vista (CSV)</button>
+          </div>
+        </section>
+
+        <section class="card kpis">
+          <div class="card-header">
+            <h2>KPIs sucursal</h2>
+            <div class="hint">Recalculados con filtros</div>
+          </div>
+
+          <div class="kpi-grid kpi-grid-4">
+            <div class="kpi">
+              <div class="kpi-label">Meses usados</div>
+              <div class="kpi-value" id="kpiMeses">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">SKUs (vista)</div>
+              <div class="kpi-value" id="kpiSkus">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Inv total (piezas)</div>
+              <div class="kpi-value" id="kpiInv">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Cobertura (días) mediana</div>
+              <div class="kpi-value" id="kpiCobMed">—</div>
+            </div>
+          </div>
+
+          <div class="kpi-grid kpi-grid-4 mt12">
+            <div class="kpi">
+              <div class="kpi-label">Prom. venta mes (total)</div>
+              <div class="kpi-value" id="kpiProm">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">% Riesgo (&lt;15 días)</div>
+              <div class="kpi-value" id="kpiRisk">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">% Sobreinv (&gt;60 días)</div>
+              <div class="kpi-value" id="kpiOver">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Sin Mov con inv</div>
+              <div class="kpi-value" id="kpiSinMovInv">—</div>
+            </div>
+          </div>
+
+          <div class="kpi-breakdown">
+            <div class="mini"><span class="dot a"></span> A: <b id="kpiA">—</b></div>
+            <div class="mini"><span class="dot b"></span> B: <b id="kpiB">—</b></div>
+            <div class="mini"><span class="dot c"></span> C: <b id="kpiC">—</b></div>
+            <div class="mini"><span class="dot s"></span> Sin Mov: <b id="kpiS">—</b></div>
+          </div>
+        </section>
+      </section>
+
+      <section class="grid2">
+        <section class="card chart-card">
+          <div class="card-header">
+            <h2>Distribución Cobertura (días)</h2>
+            <div class="hint">0–15, 16–30, 31–60, 61–120, &gt;120</div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chartHist"></canvas>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-header">
+            <h2>Top SKUs</h2>
+            <div class="hint">Sobreinventario vs Riesgo</div>
+          </div>
+
+          <div class="rank-grid">
+            <div class="rank">
+              <div class="rank-title">Top 15 Sobreinventario</div>
+              <ol id="topOver" class="rank-list small"></ol>
+            </div>
+            <div class="rank">
+              <div class="rank-title">Top 15 Riesgo</div>
+              <ol id="topRisk" class="rank-list small"></ol>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="card table-card">
+        <div class="card-header">
+          <h2>Tabla</h2>
+          <div class="hint" id="tableHint">—</div>
+        </div>
+
+        <div class="table-wrap">
+          <table id="dataTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>© El Cedro • Web local para análisis interno • No sube archivos</div>
+  </footer>
+</body>
+</html>
