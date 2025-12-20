@@ -46,8 +46,17 @@
     </section>
 
     <section class="card tabs">
+      <!-- EXISTENTES -->
       <button id="tabSummary" class="tab active" disabled>Resumen General</button>
       <button id="tabDetail" class="tab" disabled>Detalle por Sucursal</button>
+
+      <!-- NUEVAS -->
+      <button id="tabFinder" class="tab" disabled>Buscador SKU</button>
+      <button id="tabOppBreak" class="tab" disabled>Oportunidades (Quiebres)</button>
+      <button id="tabOppOver" class="tab" disabled>Oportunidades (Sobreinv)</button>
+      <button id="tabHistCateg" class="tab" disabled>Histórico Categorías</button>
+      <button id="tabHistMarca" class="tab" disabled>Histórico Marcas</button>
+
       <div class="tab-note">Clic para cambiar de vista</div>
     </section>
 
@@ -56,6 +65,16 @@
       <section class="card kpis">
         <div class="card-header">
           <h2>Foto General</h2>
+
+          <div class="header-right">
+            <div class="inline-field">
+              <label class="inline-label">Sucursal (Executive)</label>
+              <select id="summaryWarehouseSelect" disabled>
+                <option value="ALL">Todas</option>
+              </select>
+            </div>
+          </div>
+
           <div class="hint">Umbrales: Riesgo &lt; 15 días • Sobreinventario &gt; 60 días</div>
         </div>
 
@@ -190,7 +209,7 @@
 
             <div class="field">
               <label>Búsqueda (Código o Descripción)</label>
-              <input id="searchInput" type="text" placeholder="Ej. 750123... o BARNIZ..." disabled />
+              <input id="searchInput" type="text" placeholder="Ej. BER 001... o BARNIZ..." disabled />
             </div>
 
             <div class="field">
@@ -323,8 +342,351 @@
             <tbody></tbody>
           </table>
         </div>
+
+        <div class="table-footer">
+          <div class="pager">
+            <button id="detailPrev" class="btn tiny secondary" disabled>◀</button>
+            <span id="detailPageInfo" class="muted">—</span>
+            <button id="detailNext" class="btn tiny secondary" disabled>▶</button>
+          </div>
+          <div class="pager">
+            <label class="muted">Filas:</label>
+            <select id="detailPageSize" class="miniSelect" disabled>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+        </div>
       </section>
     </section>
+
+    <!-- ================== BUSCADOR SKU (multi-sucursal) ================== -->
+    <section id="finderView" class="view hidden">
+      <section class="card">
+        <div class="card-header">
+          <h2>Buscador SKU (todas las sucursales)</h2>
+          <div class="hint">Busca por Código o Descripción. Verás clasificación + inventario por sucursal.</div>
+        </div>
+
+        <div class="toolbar">
+          <input id="finderSearch" class="input" type="text" placeholder="Buscar… (código o descripción)" disabled />
+          <label class="chip">
+            <input id="finderOnlyInv" type="checkbox" disabled />
+            <span>Solo SKUs con inv &gt; 0 en alguna sucursal</span>
+          </label>
+          <button id="finderExport" class="btn" disabled>⬇️ Exportar (CSV)</button>
+        </div>
+
+        <div class="table-wrap">
+          <table id="finderTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="table-footer">
+          <div class="pager">
+            <button id="finderPrev" class="btn tiny secondary" disabled>◀</button>
+            <span id="finderPageInfo" class="muted">—</span>
+            <button id="finderNext" class="btn tiny secondary" disabled>▶</button>
+          </div>
+          <div class="pager">
+            <label class="muted">Filas:</label>
+            <select id="finderPageSize" class="miniSelect" disabled>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ================== OPORTUNIDADES: EVITAR QUIEBRES ================== -->
+    <section id="oppBreakView" class="view hidden">
+      <section class="card">
+        <div class="card-header">
+          <h2>Oportunidades: evitar quiebres</h2>
+          <div class="hint">Sucursal objetivo: toma A/B con riesgo (&lt;15 días) y busca ese SKU en otras sucursales en C/Sin Mov con inventario.</div>
+        </div>
+
+        <div class="toolbar">
+          <div class="inline-field">
+            <label class="inline-label">Sucursal objetivo</label>
+            <select id="oppBreakTarget" disabled></select>
+          </div>
+
+          <label class="chip">
+            <input id="oppBreakOnlyRisk" type="checkbox" checked disabled />
+            <span>Solo riesgo (&lt;15 días)</span>
+          </label>
+
+          <button id="oppBreakExport" class="btn" disabled>⬇️ Exportar (CSV)</button>
+        </div>
+
+        <div class="table-wrap">
+          <table id="oppBreakTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="table-footer">
+          <div class="pager">
+            <button id="oppBreakPrev" class="btn tiny secondary" disabled>◀</button>
+            <span id="oppBreakPageInfo" class="muted">—</span>
+            <button id="oppBreakNext" class="btn tiny secondary" disabled>▶</button>
+          </div>
+          <div class="pager">
+            <label class="muted">Filas:</label>
+            <select id="oppBreakPageSize" class="miniSelect" disabled>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ================== OPORTUNIDADES: REDUCIR SOBREINVENTARIO ================== -->
+    <section id="oppOverView" class="view hidden">
+      <section class="card">
+        <div class="card-header">
+          <h2>Oportunidades: reducir sobreinventario</h2>
+          <div class="hint">Sucursal objetivo: toma C/Sin Mov con sobreinv (&gt;60 días) y busca sucursales donde ese SKU está en A/B.</div>
+        </div>
+
+        <div class="toolbar">
+          <div class="inline-field">
+            <label class="inline-label">Sucursal objetivo</label>
+            <select id="oppOverTarget" disabled></select>
+          </div>
+
+          <label class="chip">
+            <input id="oppOverOnlyOver" type="checkbox" checked disabled />
+            <span>Solo sobreinv (&gt;60 días)</span>
+          </label>
+
+          <button id="oppOverExport" class="btn" disabled>⬇️ Exportar (CSV)</button>
+        </div>
+
+        <div class="table-wrap">
+          <table id="oppOverTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="table-footer">
+          <div class="pager">
+            <button id="oppOverPrev" class="btn tiny secondary" disabled>◀</button>
+            <span id="oppOverPageInfo" class="muted">—</span>
+            <button id="oppOverNext" class="btn tiny secondary" disabled>▶</button>
+          </div>
+          <div class="pager">
+            <label class="muted">Filas:</label>
+            <select id="oppOverPageSize" class="miniSelect" disabled>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ================== HISTORICO CATEGORIAS ================== -->
+    <section id="histCategView" class="view hidden">
+      <section class="card">
+        <div class="card-header">
+          <h2>Histórico por Categoría</h2>
+          <div class="hint">Fuente: hoja <b>RESUMEN_MES_SUC_CATEG</b>. Depende de filtros. Incluye 2 tablas (detalle + histórico por sucursal) y litros por sucursal.</div>
+        </div>
+
+        <div class="toolbar">
+          <div class="inline-field">
+            <label class="inline-label">Sucursal</label>
+            <select id="histCategSucursal" disabled>
+              <option value="ALL">Todas</option>
+            </select>
+          </div>
+
+          <div class="inline-field">
+            <label class="inline-label">Buscar categoría</label>
+            <input id="histCategSearch" class="input" type="text" placeholder="Ej. PINTURA..." disabled />
+          </div>
+
+          <div class="inline-field">
+            <label class="inline-label">Mes desde</label>
+            <input id="histCategFrom" class="input" type="text" placeholder="YYYY-MM" disabled />
+          </div>
+          <div class="inline-field">
+            <label class="inline-label">Mes hasta</label>
+            <input id="histCategTo" class="input" type="text" placeholder="YYYY-MM" disabled />
+          </div>
+
+          <button id="histCategExport" class="btn" disabled>⬇️ Exportar (CSV)</button>
+        </div>
+
+        <section class="grid2">
+          <section class="card inner">
+            <div class="card-header">
+              <h2>Histórico $ por mes x sucursal</h2>
+              <div class="hint">Totales mensuales (todas las categorías aplicando filtros)</div>
+            </div>
+            <div class="table-wrap">
+              <table id="histCategPivotMoney">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card inner">
+            <div class="card-header">
+              <h2>Histórico Litros por mes x sucursal</h2>
+              <div class="hint">Litros Vendidos mensuales (aplicando filtros)</div>
+            </div>
+            <div class="table-wrap">
+              <table id="histCategPivotLitros">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="card inner mt12">
+          <div class="card-header">
+            <h2>Detalle (Categoría)</h2>
+            <div class="hint">Mes, Sucursal, Categoría, Monto_venta ($), Litros Vendidos</div>
+          </div>
+          <div class="table-wrap">
+            <table id="histCategDetail">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div class="table-footer">
+            <div class="pager">
+              <button id="histCategPrev" class="btn tiny secondary" disabled>◀</button>
+              <span id="histCategPageInfo" class="muted">—</span>
+              <button id="histCategNext" class="btn tiny secondary" disabled>▶</button>
+            </div>
+            <div class="pager">
+              <label class="muted">Filas:</label>
+              <select id="histCategPageSize" class="miniSelect" disabled>
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+            </div>
+          </div>
+        </section>
+      </section>
+    </section>
+
+    <!-- ================== HISTORICO MARCAS ================== -->
+    <section id="histMarcaView" class="view hidden">
+      <section class="card">
+        <div class="card-header">
+          <h2>Histórico por Marca</h2>
+          <div class="hint">Fuente: hoja <b>RESUMEN_MES_SUC_MARCA</b>. Depende de filtros. Incluye 2 tablas (detalle + histórico por sucursal) y litros por sucursal.</div>
+        </div>
+
+        <div class="toolbar">
+          <div class="inline-field">
+            <label class="inline-label">Sucursal</label>
+            <select id="histMarcaSucursal" disabled>
+              <option value="ALL">Todas</option>
+            </select>
+          </div>
+
+          <div class="inline-field">
+            <label class="inline-label">Buscar marca</label>
+            <input id="histMarcaSearch" class="input" type="text" placeholder="Ej. TRUPER..." disabled />
+          </div>
+
+          <div class="inline-field">
+            <label class="inline-label">Mes desde</label>
+            <input id="histMarcaFrom" class="input" type="text" placeholder="YYYY-MM" disabled />
+          </div>
+          <div class="inline-field">
+            <label class="inline-label">Mes hasta</label>
+            <input id="histMarcaTo" class="input" type="text" placeholder="YYYY-MM" disabled />
+          </div>
+
+          <button id="histMarcaExport" class="btn" disabled>⬇️ Exportar (CSV)</button>
+        </div>
+
+        <section class="grid2">
+          <section class="card inner">
+            <div class="card-header">
+              <h2>Histórico $ por mes x sucursal</h2>
+              <div class="hint">Totales mensuales (todas las marcas aplicando filtros)</div>
+            </div>
+            <div class="table-wrap">
+              <table id="histMarcaPivotMoney">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card inner">
+            <div class="card-header">
+              <h2>Histórico Litros por mes x sucursal</h2>
+              <div class="hint">Litros Vendidos mensuales (aplicando filtros)</div>
+            </div>
+            <div class="table-wrap">
+              <table id="histMarcaPivotLitros">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="card inner mt12">
+          <div class="card-header">
+            <h2>Detalle (Marca)</h2>
+            <div class="hint">Mes, Sucursal, Marca, Monto_venta ($), Litros Vendidos</div>
+          </div>
+          <div class="table-wrap">
+            <table id="histMarcaDetail">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div class="table-footer">
+            <div class="pager">
+              <button id="histMarcaPrev" class="btn tiny secondary" disabled>◀</button>
+              <span id="histMarcaPageInfo" class="muted">—</span>
+              <button id="histMarcaNext" class="btn tiny secondary" disabled>▶</button>
+            </div>
+            <div class="pager">
+              <label class="muted">Filas:</label>
+              <select id="histMarcaPageSize" class="miniSelect" disabled>
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+            </div>
+          </div>
+        </section>
+      </section>
+    </section>
+
   </main>
 
   <footer class="footer">
