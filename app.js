@@ -1,1009 +1,1552 @@
-/* ============================
-   Maestro Inventarios - Client-side (GitHub Pages)
-   - Carga XLSX/CSV
-   - Resumen general: KPIs + stacked 100% + heatmap + rankings + insights
-   - Detalle por sucursal: filtros + histograma + top lists + tabla
-   - Umbrales: Riesgo < 15 días | Sobreinv > 60 días
-============================ */
+/* =========================================================
+   Maestro Inventarios - El Cedro (GitHub Pages)
+   - Lee XLSX/CSV local (SheetJS)
+   - Lee 3 hojas si existen:
+     OUTPUT, RESUMEN_MES_SUC_CATEG, RESUMEN_MES_SUC_MARCA
+   - Mantiene Resumen/Detalle y agrega:
+     Buscador SKU, Oportunidades (Quiebres), Oportunidades (Sobreinv),
+     Histórico Categorías, Histórico Marcas (con pivots $ y litros)
+========================================================= */
 
-const el = (id) => document.getElementById(id);
+/* ===================== CONFIG ===================== */
+const BRANCHES = [
+  { key: "adelitas", label: "ADELITAS", colKeyHint: "adelitas" },
+  { key: "express", label: "EXPRESS", colKeyHint: "express" },
+  { key: "general", label: "GENERAL", colKeyHint: "general" },
+  { key: "ilustres", label: "H ILUSTRES", colKeyHint: "ilustres" },
+  { key: "san_agust", label: "SAN AGUST", colKeyHint: "san agustin" },
+];
 
-// Thresholds (pedido)
-const TH_RISK = 15;
-const TH_OVER = 60;
+const THRESH_RISK_DAYS = 15;
+const THRESH_OVER_DAYS = 60;
 
-// UI - common
-const fileInput = el("fileInput");
-const btnClear = el("btnClear");
-const statusMsg = el("statusMsg");
-const statusMeta = el("statusMeta");
+// Para “Oportunidades” (recomendación)
+const TARGET_RISK_DAYS = 15;     // objetivo mínimo
+const TARGET_OVER_DAYS = 60;     // objetivo máximo (para definir exceso)
 
-// Tabs
-const tabSummary = el("tabSummary");
-const tabDetail = el("tabDetail");
-const summaryView = el("summaryView");
-const detailView = el("detailView");
+const SHEET_OUTPUT = "OUTPUT";
+const SHEET_CATEG = "RESUMEN_MES_SUC_CATEG";
+const SHEET_MARCA = "RESUMEN_MES_SUC_MARCA";
 
-// Summary KPIs
-const gMeses = el("gMeses");
-const gSkus = el("gSkus");
-const gInv = el("gInv");
-const gCobDias = el("gCobDias");
-const gPromMes = el("gPromMes");
-const gRiskPct = el("gRiskPct");
-const gOverPct = el("gOverPct");
-const gSinMovInv = el("gSinMovInv");
+/* ===================== STATE ===================== */
+const state = {
+  fileName: null,
+  loaded: false,
 
-// Summary visuals + tables
-const heatTable = el("heatTable");
-const heatHead = heatTable.querySelector("thead");
-const heatBody = heatTable.querySelector("tbody");
-const rankRisk = el("rankRisk");
-const rankOver = el("rankOver");
-const insights = el("insights");
+  outputRows: [],       // base SKU rows
+  monthsUsed: null,
 
-// Detail UI
-const btnExport = el("btnExport");
-const warehouseSelect = el("warehouseSelect");
-const classSelect = el("classSelect");
-const searchInput = el("searchInput");
-const onlyInvToggle = el("onlyInvToggle");
-const covMin = el("covMin");
-const covMax = el("covMax");
-const onlySinMovInv = el("onlySinMovInv");
-const onlyABZero = el("onlyABZero");
+  // históricos
+  histCateg: [],        // rows: {mes, sucursal, item, monto, litros}
+  histMarca: [],
 
-const tableHint = el("tableHint");
-const dataTable = el("dataTable");
-const thead = dataTable.querySelector("thead");
-const tbody = dataTable.querySelector("tbody");
+  // UI
+  currentView: "summary",
+  charts: {
+    stacked: null,
+    riskOver: null,
+    dist: null,
+  },
 
-// Detail KPIs
-const kpiMeses = el("kpiMeses");
-const kpiSkus = el("kpiSkus");
-const kpiInv = el("kpiInv");
-const kpiCobMed = el("kpiCobMed");
-const kpiProm = el("kpiProm");
-const kpiRisk = el("kpiRisk");
-const kpiOver = el("kpiOver");
-const kpiSinMovInv = el("kpiSinMovInv");
-const kpiA = el("kpiA");
-const kpiB = el("kpiB");
-const kpiC = el("kpiC");
-const kpiS = el("kpiS");
+  // paginación (varias tablas)
+  detail: { page: 1, pageSize: 100, sortKey: null, sortDir: "desc" },
+  finder: { page: 1, pageSize: 100, sortKey: null, sortDir: "asc" },
+  oppBreak: { page: 1, pageSize: 100, sortKey: null, sortDir: "desc" },
+  oppOver: { page: 1, pageSize: 100, sortKey: null, sortDir: "desc" },
+  histCategUI: { page: 1, pageSize: 100, sortKey: null, sortDir: "desc" },
+  histMarcaUI: { page: 1, pageSize: 100, sortKey: null, sortDir: "desc" },
+};
 
-// Detail tops
-const topOver = el("topOver");
-const topRisk = el("topRisk");
+/* ===================== HELPERS ===================== */
+function $(id){ return document.getElementById(id); }
 
-// Charts
-let chartStacked = null;
-let chartRiskOver = null;
-let chartHist = null;
-
-// Data state
-let MASTER = [];        // array of rows (objects)
-let WAREHOUSES = [];    // list of warehouse keys as found in columns (e.g. "adelitas", "express"...)
-let MONTHS_USED = null; // from MesesUsados (first row)
-let sortKey = null;
-let sortDir = "asc"; // asc|desc
-
-// ======= Helpers =======
-function setStatus(msg, meta=""){
-  statusMsg.textContent = msg;
-  statusMeta.textContent = meta;
+function normKey(s){
+  return String(s ?? "")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+    .replace(/[^a-z0-9]+/g,"")
+    .trim();
 }
 
-function setEnabled(enabled){
-  btnClear.disabled = !enabled;
-  tabSummary.disabled = !enabled;
-  tabDetail.disabled = !enabled;
-
-  btnExport.disabled = !enabled;
-  warehouseSelect.disabled = !enabled;
-  classSelect.disabled = !enabled;
-  searchInput.disabled = !enabled;
-  onlyInvToggle.disabled = !enabled;
-  covMin.disabled = !enabled;
-  covMax.disabled = !enabled;
-  onlySinMovInv.disabled = !enabled;
-  onlyABZero.disabled = !enabled;
+function toNumber(x){
+  if (x === null || x === undefined || x === "") return 0;
+  if (typeof x === "number") return isFinite(x) ? x : 0;
+  const s = String(x).trim();
+  // currency or formatted
+  const clean = s.replace(/[^0-9.\-]/g,"");
+  const n = parseFloat(clean);
+  return isFinite(n) ? n : 0;
 }
 
-function fmtNum(n, dec=0){
-  if (n === null || n === undefined || n === "") return "—";
-  const x = Number(n);
-  if (!Number.isFinite(x)) return "—";
-  return x.toLocaleString("es-MX", { maximumFractionDigits: dec, minimumFractionDigits: dec });
+function toInt(x){
+  const n = Math.round(toNumber(x));
+  return isFinite(n) ? n : 0;
 }
 
-function pct(n, d, dec=1){
-  if (!d) return "0%";
-  return (100 * (n/d)).toLocaleString("es-MX", { maximumFractionDigits: dec, minimumFractionDigits: dec }) + "%";
+function formatInt(n){
+  return new Intl.NumberFormat("es-MX", { maximumFractionDigits: 0 }).format(toNumber(n));
 }
 
-function safeNum(x){
-  const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
+function formatMoney(n){
+  return new Intl.NumberFormat("es-MX", { style:"currency", currency:"MXN", maximumFractionDigits: 2 }).format(toNumber(n));
 }
 
-function median(nums){
-  const arr = nums.filter(n => Number.isFinite(n)).slice().sort((a,b)=>a-b);
-  if (!arr.length) return null;
-  const mid = Math.floor(arr.length/2);
-  return arr.length % 2 ? arr[mid] : (arr[mid-1] + arr[mid]) / 2;
+// Promedio Vta Mes: 1 decimal solo si >0 y no entero. Si es entero o 0, sin decimal.
+function formatProm(n){
+  const v = toNumber(n);
+  if (!isFinite(v) || v === 0) return "0";
+  const isInt = Math.abs(v - Math.round(v)) < 1e-9;
+  if (isInt) return String(Math.round(v));
+  return new Intl.NumberFormat("es-MX", { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(v);
 }
 
-function debounce(fn, ms){
-  let t = null;
-  return (...args) => {
-    clearTimeout(t);
-    t = setTimeout(() => fn(...args), ms);
-  };
+// Cobertura (Mes) y Cobertura Dias: sin decimales (redondeo)
+function formatNoDecimals(n){
+  return String(Math.round(toNumber(n)));
 }
 
-function colMap(wh){
-  return {
-    inv: `Inv-${wh}`,
-    cls: `Clasificacion-${wh}`,
-    prom: `Promedio Vta Mes-${wh}`,
-    cobMes: `Cobertura (Mes)-${wh}`,
-    cobDias: `Cobertura Dias (30) -${wh}`,
-  };
+function pct(n){
+  return new Intl.NumberFormat("es-MX", { style:"percent", maximumFractionDigits: 1 }).format(n);
 }
 
-function normalizeColumns(rows){
-  return rows.map(r => {
-    const out = {};
-    Object.keys(r).forEach(k => out[String(k).trim()] = r[k]);
-    return out;
-  });
+function median(arr){
+  const a = arr.filter(v => isFinite(v)).sort((x,y)=>x-y);
+  if (!a.length) return 0;
+  const mid = Math.floor(a.length/2);
+  return a.length % 2 ? a[mid] : (a[mid-1]+a[mid])/2;
 }
 
-// ======= Parsing =======
-function splitCSVLine(line){
-  const out = [];
-  let cur = "";
-  let inQ = false;
-  for (let i=0; i<line.length; i++){
-    const ch = line[i];
-    if (ch === '"'){
-      if (inQ && line[i+1] === '"'){ cur += '"'; i++; }
-      else inQ = !inQ;
-    } else if (ch === "," && !inQ){
-      out.push(cur);
-      cur = "";
-    } else {
-      cur += ch;
-    }
+function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
+
+function normalizeSucursalLabel(s){
+  const t = String(s||"").trim().toUpperCase();
+  // ya vienen correctas según tú, pero dejamos tolerancia:
+  if (t.includes("ADEL")) return "ADELITAS";
+  if (t.includes("EXP")) return "EXPRESS";
+  if (t.includes("GEN")) return "GENERAL";
+  if (t.includes("ILUST")) return "H ILUSTRES";
+  if (t.includes("SAN")) return "SAN AGUST";
+  return t;
+}
+
+function isRisk(covDays){
+  const d = toNumber(covDays);
+  return d > 0 && d < THRESH_RISK_DAYS;
+}
+function isOver(covDays){
+  const d = toNumber(covDays);
+  return d > THRESH_OVER_DAYS;
+}
+
+function safeClass(x){
+  const s = String(x||"").trim();
+  if (!s) return "Sin Mov";
+  if (s.toUpperCase() === "SIN MOV") return "Sin Mov";
+  if (s === "A" || s === "B" || s === "C") return s;
+  return s;
+}
+
+function findSheetName(wb, target){
+  // match exact or case-insensitive or normalized
+  const targetN = normKey(target);
+  const names = wb.SheetNames || [];
+  for (const n of names){
+    if (normKey(n) === targetN) return n;
   }
-  out.push(cur);
-  return out;
-}
-
-function parseCSV(text){
-  const lines = text.split(/\r?\n/).filter(l => l.trim().length);
-  if (!lines.length) return [];
-  const headers = splitCSVLine(lines[0]).map(h => h.trim());
-  const rows = [];
-  for (let i=1; i<lines.length; i++){
-    const vals = splitCSVLine(lines[i]);
-    const obj = {};
-    headers.forEach((h, idx) => obj[h] = vals[idx] ?? "");
-    rows.push(obj);
+  // contains
+  for (const n of names){
+    if (normKey(n).includes(targetN)) return n;
   }
-  return rows;
+  return null;
 }
 
-function parseXLSX(arrayBuffer){
-  const wb = XLSX.read(arrayBuffer, { type: "array" });
-  const ws = wb.Sheets[wb.SheetNames[0]];
+function sheetToRows(wb, sheetName){
+  const ws = wb.Sheets[sheetName];
+  if (!ws) return [];
   return XLSX.utils.sheet_to_json(ws, { defval: "" });
 }
 
-// ======= Detection/validation =======
-function detectWarehouses(rows){
-  if (!rows.length) return [];
-  const cols = Object.keys(rows[0]);
-  const invCols = cols.filter(c => c.startsWith("Inv-"));
-  return invCols.map(c => c.replace("Inv-", "").trim());
+function mesYYYYMM(value){
+  // Acepta: Date, number (excel date), string
+  if (!value) return "";
+  if (value instanceof Date && !isNaN(value.getTime())){
+    const y = value.getFullYear();
+    const m = String(value.getMonth()+1).padStart(2,"0");
+    return `${y}-${m}`;
+  }
+  // SheetJS suele traer date como string o number según parsing.
+  const s = String(value).trim();
+  // si ya viene YYYY-MM, úsalo
+  if (/^\d{4}-\d{2}$/.test(s)) return s;
+
+  // si viene tipo "Sun Jun 01 2025 ..." o similar:
+  const dt = new Date(s);
+  if (!isNaN(dt.getTime())){
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth()+1).padStart(2,"0");
+    return `${y}-${m}`;
+  }
+
+  // fallback: intenta partir por /
+  // 01/08/2025 -> 2025-08 (si fuera)
+  const m1 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m1){
+    const y = m1[3];
+    const mm = String(m1[2]).padStart(2,"0");
+    return `${y}-${mm}`;
+  }
+
+  return s; // último recurso
 }
 
-function validateMaster(rows){
-  if (!rows.length) throw new Error("El archivo está vacío.");
-  const cols = Object.keys(rows[0]);
+/* ===================== PARSE OUTPUT ===================== */
+function parseOutput(rows){
+  if (!rows.length) return { rows: [], monthsUsed: 0 };
 
-  for (const c of ["Codigo", "desc_prod"]) {
-    if (!cols.includes(c)) throw new Error(`Falta columna obligatoria: ${c}`);
-  }
-
-  const warehouses = detectWarehouses(rows);
-  if (!warehouses.length) throw new Error("No encontré columnas tipo 'Inv-ALMACEN'.");
-
-  for (const wh of warehouses){
-    const m = colMap(wh);
-    for (const col of Object.values(m)){
-      if (!cols.includes(col)) throw new Error(`Falta columna '${col}' para sucursal '${wh}'.`);
+  // Build normalized key map per row for robust access
+  const parsed = [];
+  for (const r of rows){
+    const keys = Object.keys(r);
+    const nk = {};
+    for (const k of keys){
+      nk[normKey(k)] = k;
     }
+
+    const codeKey = nk[normKey("Codigo")] || nk[normKey("Cve_prod")] || nk["codigo"] || nk["cveprod"];
+    const descKey = nk[normKey("desc_prod")] || nk[normKey("Desc_prod")] || nk["descprod"] || nk["desc_prod"];
+    const mesesKey = nk[normKey("MesesUsados")] || nk["mesesusados"];
+
+    const codigo = String(r[codeKey] ?? "").trim();
+    if (!codigo) continue;
+
+    const obj = {
+      codigo,
+      desc: String(r[descKey] ?? "").trim(),
+      mesesUsados: toInt(r[mesesKey]),
+      byBranch: {}
+    };
+
+    for (const b of BRANCHES){
+      const invK = nk[normKey(`Inv-${b.colKeyHint}`)] || nk[normKey(`Inv ${b.colKeyHint}`)] || nk[normKey(`Inv-${b.key}`)];
+      const clsK = nk[normKey(`Clasificacion-${b.colKeyHint}`)] || nk[normKey(`Clasificación-${b.colKeyHint}`)] || nk[normKey(`Clasificacion ${b.colKeyHint}`)];
+      const promK = nk[normKey(`Promedio Vta Mes-${b.colKeyHint}`)] || nk[normKey(`Promedio Vta Mes ${b.colKeyHint}`)];
+      const covMesK = nk[normKey(`Cobertura (Mes)-${b.colKeyHint}`)] || nk[normKey(`Cobertura (Mes) -${b.colKeyHint}`)] || nk[normKey(`Cobertura Mes-${b.colKeyHint}`)];
+      const covDiaK = nk[normKey(`Cobertura Dias (30)-${b.colKeyHint}`)] ||
+                      nk[normKey(`Cobertura Dias (30) -${b.colKeyHint}`)] ||
+                      nk[normKey(`Cobertura Dias (30) -${b.colKeyHint}`)] ||
+                      nk[normKey(`Cobertura Dias (30)-${b.key}`)] ||
+                      nk[normKey(`Cobertura Dias (30) -${b.key}`)];
+
+      const inv = toInt(r[invK]);
+      const cls = safeClass(r[clsK]);
+      const prom = toNumber(r[promK]);
+      const covMes = toNumber(r[covMesK]);
+      const covDays = toNumber(r[covDiaK]);
+
+      obj.byBranch[b.key] = { inv, cls, prom, covMes, covDays };
+    }
+
+    parsed.push(obj);
   }
 
-  return warehouses;
+  const monthsUsed = parsed.length ? (parsed[0].mesesUsados || 0) : 0;
+  return { rows: parsed, monthsUsed };
 }
 
-function coerceTypes(rows, warehouses){
-  const out = rows.map(r => ({...r}));
+/* ===================== PARSE HIST ===================== */
+function parseHist(rows, mode /* "CATEG" | "MARCA" */){
+  const out = [];
+  for (const r of rows){
+    const keys = Object.keys(r);
+    const nk = {};
+    for (const k of keys) nk[normKey(k)] = k;
 
-  MONTHS_USED = null;
-  if ("MesesUsados" in out[0]){
-    MONTHS_USED = safeNum(out[0]["MesesUsados"]) || null;
-  }
+    const mesK = nk[normKey("Mes")] || nk["mes"];
+    const sucK = nk[normKey("Sucursal")] || nk["sucursal"];
+    const itemK = mode === "CATEG"
+      ? (nk[normKey("Categoria")] || nk["categoria"])
+      : (nk[normKey("Marca")] || nk["marca"]);
+    const montoK = nk[normKey("Monto_venta")] || nk[normKey("Monto venta")] || nk["montoventa"] || nk["monto_venta"];
+    const litrosK = nk[normKey("Litros Vendidos")] || nk[normKey("LitrosVendidos")] || nk["litrosvendidos"] || nk["litrosvendidos"];
 
-  for (const r of out){
-    r["Codigo"] = String(r["Codigo"] ?? "").trim();
-    r["desc_prod"] = String(r["desc_prod"] ?? "").trim();
+    const mes = mesYYYYMM(r[mesK]);
+    const suc = normalizeSucursalLabel(r[sucK]);
+    const item = String(r[itemK] ?? "").trim();
+    if (!mes || !suc || !item) continue;
 
-    for (const wh of warehouses){
-      const m = colMap(wh);
-      r[m.inv] = safeNum(r[m.inv]);
-      r[m.prom] = safeNum(r[m.prom]);
-      r[m.cobMes] = safeNum(r[m.cobMes]);
-      r[m.cobDias] = safeNum(r[m.cobDias]);
-      r[m.cls] = String(r[m.cls] ?? "").trim();
-    }
+    const monto = toNumber(r[montoK]);
+    const litros = toNumber(r[litrosK]);
+
+    out.push({ mes, sucursal: suc, item, monto, litros });
   }
   return out;
 }
 
-function fillWarehouseSelect(warehouses){
-  warehouseSelect.innerHTML = "";
-  warehouses.forEach(wh => {
-    const opt = document.createElement("option");
-    opt.value = wh;
-    opt.textContent = wh;
-    warehouseSelect.appendChild(opt);
-  });
-  warehouseSelect.value = warehouses[0] || "";
+/* ===================== UI INIT ===================== */
+function setStatus(msg, meta=""){
+  $("statusMsg").textContent = msg;
+  $("statusMeta").textContent = meta || "";
 }
 
-// ======= Summary computations =======
-function computeSummaryByWarehouse(){
-  // returns map: wh -> metrics
-  const map = {};
-  const skuCount = MASTER.length; // each row is a SKU
-  for (const wh of WAREHOUSES){
-    const m = colMap(wh);
-
-    const A = MASTER.filter(r => r[m.cls] === "A").length;
-    const B = MASTER.filter(r => r[m.cls] === "B").length;
-    const C = MASTER.filter(r => r[m.cls] === "C").length;
-    const S = MASTER.filter(r => r[m.cls] === "Sin Mov").length;
-
-    const invTotal = MASTER.reduce((acc,r)=>acc + safeNum(r[m.inv]), 0);
-    const promTotal = MASTER.reduce((acc,r)=>acc + safeNum(r[m.prom]), 0);
-
-    const covArr = MASTER.map(r => safeNum(r[m.cobDias])).filter(x => Number.isFinite(x) && x >= 0);
-    const covMed = median(covArr);
-
-    const riskCount = MASTER.filter(r => safeNum(r[m.cobDias]) > 0 && safeNum(r[m.cobDias]) < TH_RISK).length;
-    const overCount = MASTER.filter(r => safeNum(r[m.cobDias]) > TH_OVER).length;
-
-    const sinMovInv = MASTER.filter(r => r[m.cls] === "Sin Mov" && safeNum(r[m.inv]) > 0).length;
-
-    // inventory pieces in risk/over bands (piezas)
-    const riskInv = MASTER.reduce((acc,r)=> {
-      const d = safeNum(r[m.cobDias]);
-      if (d > 0 && d < TH_RISK) return acc + safeNum(r[m.inv]);
-      return acc;
-    }, 0);
-    const overInv = MASTER.reduce((acc,r)=> {
-      const d = safeNum(r[m.cobDias]);
-      if (d > TH_OVER) return acc + safeNum(r[m.inv]);
-      return acc;
-    }, 0);
-
-    map[wh] = {
-      wh,
-      skuCount,
-      A,B,C,S,
-      invTotal,
-      promTotal,
-      covMed,
-      riskCount,
-      overCount,
-      sinMovInv,
-      riskInv,
-      overInv
-    };
-  }
-  return map;
-}
-
-function computeGlobalSummary(summaryMap){
-  const skuCount = MASTER.length; // unique SKUs
-  let invAll = 0;
-  let promAll = 0;
-  let riskPairs = 0;
-  let overPairs = 0;
-  let sinMovInvPairs = 0;
-
-  for (const wh of WAREHOUSES){
-    const m = colMap(wh);
-    invAll += MASTER.reduce((a,r)=>a + safeNum(r[m.inv]), 0);
-    promAll += MASTER.reduce((a,r)=>a + safeNum(r[m.prom]), 0);
-    riskPairs += MASTER.filter(r => safeNum(r[m.cobDias]) > 0 && safeNum(r[m.cobDias]) < TH_RISK).length;
-    overPairs += MASTER.filter(r => safeNum(r[m.cobDias]) > TH_OVER).length;
-    sinMovInvPairs += MASTER.filter(r => r[m.cls] === "Sin Mov" && safeNum(r[m.inv]) > 0).length;
-  }
-
-  const pairsTotal = MASTER.length * WAREHOUSES.length;
-
-  const cobDiasGlobal = promAll > 0 ? (invAll / (promAll / 30)) : null;
-
-  return {
-    months: MONTHS_USED,
-    skus: skuCount,
-    invAll,
-    promAll,
-    cobDiasGlobal,
-    riskPct: pairsTotal ? (riskPairs / pairsTotal) : 0,
-    overPct: pairsTotal ? (overPairs / pairsTotal) : 0,
-    sinMovInvPairs
-  };
-}
-
-// ======= Rendering Summary =======
-function renderSummary(){
-  const byWh = computeSummaryByWarehouse();
-  const global = computeGlobalSummary(byWh);
-
-  // KPIs global
-  gMeses.textContent = global.months ?? "—";
-  gSkus.textContent = fmtNum(global.skus, 0);
-  gInv.textContent = fmtNum(global.invAll, 0);
-  gPromMes.textContent = fmtNum(global.promAll, 2);
-  gCobDias.textContent = global.cobDiasGlobal === null ? "—" : fmtNum(global.cobDiasGlobal, 1);
-
-  gRiskPct.textContent = (100*global.riskPct).toLocaleString("es-MX", {maximumFractionDigits:1, minimumFractionDigits:1}) + "%";
-  gOverPct.textContent = (100*global.overPct).toLocaleString("es-MX", {maximumFractionDigits:1, minimumFractionDigits:1}) + "%";
-  gSinMovInv.textContent = fmtNum(global.sinMovInvPairs, 0);
-
-  // Charts
-  renderStackedChart(byWh);
-  renderRiskOverChart(byWh);
-
-  // Heatmap table
-  renderHeatmap(byWh);
-
-  // Rankings
-  renderRankings(byWh);
-
-  // Insights
-  renderInsights(byWh, global);
-}
-
-function destroyChart(ch){
-  if (ch) { ch.destroy(); }
-}
-
-function renderStackedChart(byWh){
-  const labels = WAREHOUSES.slice();
-  const skuN = MASTER.length || 1;
-
-  const A = labels.map(wh => byWh[wh].A / skuN * 100);
-  const B = labels.map(wh => byWh[wh].B / skuN * 100);
-  const C = labels.map(wh => byWh[wh].C / skuN * 100);
-  const S = labels.map(wh => byWh[wh].S / skuN * 100);
-
-  const ctx = document.getElementById("chartStacked").getContext("2d");
-  destroyChart(chartStacked);
-
-  chartStacked = new Chart(ctx, {
-    type: "bar",
-    data: {
-      labels,
-      datasets: [
-        { label: "A", data: A, stack: "stack1" },
-        { label: "B", data: B, stack: "stack1" },
-        { label: "C", data: C, stack: "stack1" },
-        { label: "Sin Mov", data: S, stack: "stack1" },
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      indexAxis: "y",
-      plugins: {
-        legend: { position: "bottom" },
-        tooltip: {
-          callbacks: {
-            label: (ctx) => `${ctx.dataset.label}: ${ctx.raw.toFixed(1)}%`
-          }
-        }
-      },
-      scales: {
-        x: {
-          stacked: true,
-          max: 100,
-          ticks: { callback: (v)=> v + "%" }
-        },
-        y: { stacked: true }
-      }
-    }
-  });
-}
-
-function renderRiskOverChart(byWh){
-  const labels = WAREHOUSES.slice();
-  const skuN = MASTER.length || 1;
-
-  const risk = labels.map(wh => byWh[wh].riskCount / skuN * 100);
-  const over = labels.map(wh => byWh[wh].overCount / skuN * 100);
-
-  const ctx = document.getElementById("chartRiskOver").getContext("2d");
-  destroyChart(chartRiskOver);
-
-  chartRiskOver = new Chart(ctx, {
-    type: "bar",
-    data: {
-      labels,
-      datasets: [
-        { label: `Riesgo <${TH_RISK} días`, data: risk },
-        { label: `Sobreinv >${TH_OVER} días`, data: over },
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { position: "bottom" } },
-      scales: {
-        y: { ticks: { callback:(v)=> v + "%" } }
-      }
-    }
-  });
-}
-
-function heatAlpha(p){
-  // p in [0..1] -> alpha 0.06..0.35
-  return 0.06 + Math.min(0.29, p * 0.29);
-}
-
-function renderHeatmap(byWh){
-  heatHead.innerHTML = "";
-  heatBody.innerHTML = "";
-
-  const trh = document.createElement("tr");
-  ["Sucursal","A","B","C","Sin Mov","Inv total","Cobertura (días) mediana","% Riesgo","% Sobreinv","Sin Mov c/inv"].forEach(h=>{
-    const th = document.createElement("th");
-    th.textContent = h;
-    trh.appendChild(th);
-  });
-  heatHead.appendChild(trh);
-
-  const skuN = MASTER.length || 1;
-
-  for (const wh of WAREHOUSES){
-    const m = byWh[wh];
-
-    const tr = document.createElement("tr");
-
-    const td0 = document.createElement("td");
-    td0.textContent = wh;
-    td0.classList.add("mono");
-    tr.appendChild(td0);
-
-    const cells = [
-      { label:"A", val:m.A, p:m.A/skuN },
-      { label:"B", val:m.B, p:m.B/skuN },
-      { label:"C", val:m.C, p:m.C/skuN },
-      { label:"Sin Mov", val:m.S, p:m.S/skuN },
-    ];
-
-    for (const c of cells){
-      const td = document.createElement("td");
-      const box = document.createElement("div");
-      box.classList.add("heatCell");
-      box.style.background = `rgba(122,162,255,${heatAlpha(c.p)})`;
-      box.innerHTML = `<b class="mono">${fmtNum(c.val,0)}</b><span class="pct">${pct(c.val, skuN,1)}</span>`;
-      td.appendChild(box);
-      tr.appendChild(td);
-    }
-
-    const tdInv = document.createElement("td");
-    tdInv.textContent = fmtNum(m.invTotal,0);
-    tdInv.classList.add("mono");
-    tr.appendChild(tdInv);
-
-    const tdMed = document.createElement("td");
-    tdMed.textContent = m.covMed === null ? "—" : fmtNum(m.covMed,1);
-    tdMed.classList.add("mono");
-    tr.appendChild(tdMed);
-
-    const tdRisk = document.createElement("td");
-    tdRisk.textContent = pct(m.riskCount, skuN,1);
-    tdRisk.classList.add("mono");
-    tr.appendChild(tdRisk);
-
-    const tdOver = document.createElement("td");
-    tdOver.textContent = pct(m.overCount, skuN,1);
-    tdOver.classList.add("mono");
-    tr.appendChild(tdOver);
-
-    const tdSM = document.createElement("td");
-    tdSM.innerHTML = `<b class="mono">${fmtNum(m.sinMovInv,0)}</b> <span class="heatSmall">(${pct(m.sinMovInv, skuN,1)})</span>`;
-    tr.appendChild(tdSM);
-
-    heatBody.appendChild(tr);
-  }
-}
-
-function renderRankings(byWh){
-  rankRisk.innerHTML = "";
-  rankOver.innerHTML = "";
-
-  const skuN = MASTER.length || 1;
-  const arr = WAREHOUSES.map(wh => ({
-    wh,
-    riskPct: byWh[wh].riskCount / skuN,
-    overPct: byWh[wh].overCount / skuN,
-    riskInv: byWh[wh].riskInv,
-    overInv: byWh[wh].overInv
-  }));
-
-  const riskSorted = arr.slice().sort((a,b)=> b.riskPct - a.riskPct);
-  const overSorted = arr.slice().sort((a,b)=> b.overPct - a.overPct);
-
-  for (const r of riskSorted){
-    const li = document.createElement("li");
-    li.innerHTML = `<b>${r.wh}</b> — ${pct(r.riskPct,1,1)} • <span class="heatSmall">piezas en riesgo: ${fmtNum(r.riskInv,0)}</span>`;
-    rankRisk.appendChild(li);
-  }
-
-  for (const r of overSorted){
-    const li = document.createElement("li");
-    li.innerHTML = `<b>${r.wh}</b> — ${pct(r.overPct,1,1)} • <span class="heatSmall">piezas sobreinv: ${fmtNum(r.overInv,0)}</span>`;
-    rankOver.appendChild(li);
-  }
-}
-
-function renderInsights(byWh, global){
-  insights.innerHTML = "";
-  const skuN = MASTER.length || 1;
-
-  const arr = WAREHOUSES.map(wh => ({
-    wh,
-    sinMovPct: byWh[wh].S / skuN,
-    riskPct: byWh[wh].riskCount / skuN,
-    overPct: byWh[wh].overCount / skuN,
-    inv: byWh[wh].invTotal,
-    prom: byWh[wh].promTotal,
-    sinMovInv: byWh[wh].sinMovInv
-  }));
-
-  const maxSinMov = arr.slice().sort((a,b)=> b.sinMovPct - a.sinMovPct)[0];
-  const maxRisk = arr.slice().sort((a,b)=> b.riskPct - a.riskPct)[0];
-  const maxOver = arr.slice().sort((a,b)=> b.overPct - a.overPct)[0];
-  const maxInv = arr.slice().sort((a,b)=> b.inv - a.inv)[0];
-
-  const bullets = [
-    `La sucursal con mayor proporción de <b>Sin Mov</b> es <b>${maxSinMov.wh}</b> con ${pct(maxSinMov.sinMovPct,1,1)} del catálogo (SKUs).`,
-    `Mayor <b>riesgo de quiebre</b> (&lt;${TH_RISK} días) en <b>${maxRisk.wh}</b>: ${pct(maxRisk.riskPct,1,1)} de SKUs en riesgo.`,
-    `Mayor <b>sobreinventario</b> (&gt;${TH_OVER} días) en <b>${maxOver.wh}</b>: ${pct(maxOver.overPct,1,1)} de SKUs sobrestock.`,
-    `<b>${maxInv.wh}</b> concentra el mayor inventario: <b>${fmtNum(maxInv.inv,0)}</b> piezas.`,
-    `Cobertura global estimada: <b>${global.cobDiasGlobal===null?"—":fmtNum(global.cobDiasGlobal,1)}</b> días, con prom. mensual total <b>${fmtNum(global.promAll,2)}</b>.`,
-    `Sin Mov con inventario (sumando sucursales): <b>${fmtNum(global.sinMovInvPairs,0)}</b> casos SKU-sucursal (ojo: inmoviliza capital).`
+function enableUI(enable){
+  const ids = [
+    "tabSummary","tabDetail","tabFinder","tabOppBreak","tabOppOver","tabHistCateg","tabHistMarca",
+    "btnClear",
+    "warehouseSelect","classSelect","searchInput","onlyInvToggle","covMin","covMax","onlySinMovInv","onlyABZero","btnExport",
+    "detailPageSize","detailPrev","detailNext",
+    "finderSearch","finderOnlyInv","finderExport","finderPageSize","finderPrev","finderNext",
+    "oppBreakTarget","oppBreakOnlyRisk","oppBreakExport","oppBreakPageSize","oppBreakPrev","oppBreakNext",
+    "oppOverTarget","oppOverOnlyOver","oppOverExport","oppOverPageSize","oppOverPrev","oppOverNext",
+    "histCategSucursal","histCategSearch","histCategFrom","histCategTo","histCategExport","histCategPageSize","histCategPrev","histCategNext",
+    "histMarcaSucursal","histMarcaSearch","histMarcaFrom","histMarcaTo","histMarcaExport","histMarcaPageSize","histMarcaPrev","histMarcaNext",
+    "summaryWarehouseSelect"
   ];
-
-  for (const b of bullets){
-    const li = document.createElement("li");
-    li.innerHTML = b;
-    insights.appendChild(li);
+  for (const id of ids){
+    const el = $(id);
+    if (el) el.disabled = !enable;
   }
 }
 
-// ======= Detail view computations =======
-function getViewColumns(wh){
-  const m = colMap(wh);
-  return [
-    { key: "Codigo", label: "Codigo", type: "text" },
-    { key: "desc_prod", label: "desc_prod", type: "text" },
-    { key: m.inv, label: `Inv-${wh}`, type: "num", dec: 0 },
-    { key: m.cls, label: `Clasificacion-${wh}`, type: "text" },
-    { key: m.prom, label: `Promedio Vta Mes-${wh}`, type: "num", dec: 2 },
-    { key: m.cobMes, label: `Cobertura (Mes)-${wh}`, type: "num", dec: 2 },
-    { key: m.cobDias, label: `Cobertura Dias (30) -${wh}`, type: "num", dec: 2 },
-  ];
+function setActiveTab(tabId, viewId){
+  const tabIds = ["tabSummary","tabDetail","tabFinder","tabOppBreak","tabOppOver","tabHistCateg","tabHistMarca"];
+  const viewIds = ["summaryView","detailView","finderView","oppBreakView","oppOverView","histCategView","histMarcaView"];
+  tabIds.forEach(id => $(id).classList.remove("active"));
+  viewIds.forEach(id => $(id).classList.add("hidden"));
+  $(tabId).classList.add("active");
+  $(viewId).classList.remove("hidden");
 }
 
-function applyFilters(rows){
-  const wh = warehouseSelect.value;
-  const m = colMap(wh);
+function bindTabs(){
+  $("tabSummary").addEventListener("click", () => { setActiveTab("tabSummary","summaryView"); renderSummary(); });
+  $("tabDetail").addEventListener("click", () => { setActiveTab("tabDetail","detailView"); renderDetail(); });
+  $("tabFinder").addEventListener("click", () => { setActiveTab("tabFinder","finderView"); renderFinder(); });
+  $("tabOppBreak").addEventListener("click", () => { setActiveTab("tabOppBreak","oppBreakView"); renderOppBreak(); });
+  $("tabOppOver").addEventListener("click", () => { setActiveTab("tabOppOver","oppOverView"); renderOppOver(); });
+  $("tabHistCateg").addEventListener("click", () => { setActiveTab("tabHistCateg","histCategView"); renderHistCateg(); });
+  $("tabHistMarca").addEventListener("click", () => { setActiveTab("tabHistMarca","histMarcaView"); renderHistMarca(); });
+}
 
-  const cls = classSelect.value;
-  const q = (searchInput.value || "").trim().toLowerCase();
-  const onlyInv = !!onlyInvToggle.checked;
-  const minD = covMin.value !== "" ? Number(covMin.value) : null;
-  const maxD = covMax.value !== "" ? Number(covMax.value) : null;
-
-  const smInv = !!onlySinMovInv.checked;
-  const abZero = !!onlyABZero.checked;
-
-  return rows.filter(r => {
-    if (!wh) return false;
-
-    if (cls !== "ALL" && r[m.cls] !== cls) return false;
-
-    if (q){
-      const ok = (String(r.Codigo).toLowerCase().includes(q) ||
-                  String(r.desc_prod).toLowerCase().includes(q));
-      if (!ok) return false;
-    }
-
-    if (onlyInv && safeNum(r[m.inv]) <= 0) return false;
-
-    const d = safeNum(r[m.cobDias]);
-    if (minD !== null && d < minD) return false;
-    if (maxD !== null && d > maxD) return false;
-
-    if (smInv){
-      if (!(r[m.cls] === "Sin Mov" && safeNum(r[m.inv]) > 0)) return false;
-    }
-
-    if (abZero){
-      const isAB = (r[m.cls] === "A" || r[m.cls] === "B");
-      if (!(isAB && safeNum(r[m.inv]) === 0)) return false;
-    }
-
-    return true;
+/* ===================== TABLE UTILS ===================== */
+function sortRows(rows, key, dir){
+  if (!key) return rows;
+  const sgn = dir === "asc" ? 1 : -1;
+  return [...rows].sort((a,b)=>{
+    const va = a[key];
+    const vb = b[key];
+    const na = typeof va === "number";
+    const nb = typeof vb === "number";
+    if (na && nb) return (va - vb) * sgn;
+    return String(va ?? "").localeCompare(String(vb ?? ""), "es", { sensitivity:"base" }) * sgn;
   });
 }
 
-function sortRows(rows, columns){
-  if (!sortKey) return rows;
-  const col = columns.find(c => c.key === sortKey);
-  if (!col) return rows;
-
-  const dir = sortDir === "asc" ? 1 : -1;
-  const copy = [...rows];
-
-  copy.sort((a,b) => {
-    const va = a[sortKey];
-    const vb = b[sortKey];
-    if (col.type === "num") return (safeNum(va) - safeNum(vb)) * dir;
-    return String(va ?? "").localeCompare(String(vb ?? ""), "es", { sensitivity:"base" }) * dir;
-  });
-
-  return copy;
+function paginate(rows, page, pageSize){
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const p = clamp(page, 1, pages);
+  const start = (p-1)*pageSize;
+  const end = start + pageSize;
+  return { page: p, pages, total, slice: rows.slice(start,end) };
 }
 
-function renderTable(rows){
-  const wh = warehouseSelect.value;
-  const columns = getViewColumns(wh);
-
-  // header
+function renderTable(tableEl, columns, rows, onSort){
+  // columns: [{key,label,fmt?,className?}]
+  const thead = tableEl.querySelector("thead");
+  const tbody = tableEl.querySelector("tbody");
   thead.innerHTML = "";
+  tbody.innerHTML = "";
+
   const trh = document.createElement("tr");
-  columns.forEach(col => {
+  for (const c of columns){
     const th = document.createElement("th");
-    const arrow = (sortKey === col.key) ? (sortDir === "asc" ? " ▲" : " ▼") : "";
-    th.textContent = col.label + arrow;
-    th.addEventListener("click", () => {
-      if (sortKey === col.key) sortDir = (sortDir === "asc" ? "desc" : "asc");
-      else { sortKey = col.key; sortDir = "asc"; }
-      refreshDetail();
-    });
+    th.textContent = c.label;
+    if (onSort){
+      th.addEventListener("click", ()=> onSort(c.key));
+      th.title = "Clic para ordenar";
+    }
     trh.appendChild(th);
-  });
+  }
   thead.appendChild(trh);
 
-  // body
-  tbody.innerHTML = "";
-  rows.forEach(r => {
+  const frag = document.createDocumentFragment();
+  for (const r of rows){
     const tr = document.createElement("tr");
-    columns.forEach(col => {
+    for (const c of columns){
       const td = document.createElement("td");
-      const v = r[col.key];
-
-      if (col.type === "num"){
-        const n = safeNum(v);
-        td.textContent = fmtNum(n, col.dec ?? 0);
-        td.classList.add("mono");
-        if (n < 0) td.classList.add("bad");
-      } else {
-        td.textContent = String(v ?? "");
-      }
+      const v = r[c.key];
+      td.textContent = c.fmt ? c.fmt(v, r) : (v ?? "");
+      if (c.className) td.className = c.className;
       tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
-  });
-
-  // hint
-  tableHint.textContent = `Sucursal: ${wh} • Registros: ${rows.length.toLocaleString("es-MX")}`;
-
-  // KPIs + charts + tops
-  updateDetailKPIs(rows);
-  renderHist(rows);
-  renderTopLists(rows);
-}
-
-function updateDetailKPIs(viewRows){
-  const wh = warehouseSelect.value;
-  const m = colMap(wh);
-
-  const invTot = viewRows.reduce((a,r)=>a + safeNum(r[m.inv]), 0);
-  const promTot = viewRows.reduce((a,r)=>a + safeNum(r[m.prom]), 0);
-
-  const covVals = viewRows.map(r=>safeNum(r[m.cobDias])).filter(n=>Number.isFinite(n) && n>=0);
-  const covMed = median(covVals);
-
-  const countA = viewRows.filter(r => r[m.cls] === "A").length;
-  const countB = viewRows.filter(r => r[m.cls] === "B").length;
-  const countC = viewRows.filter(r => r[m.cls] === "C").length;
-  const countS = viewRows.filter(r => r[m.cls] === "Sin Mov").length;
-
-  const riskCount = viewRows.filter(r => {
-    const d = safeNum(r[m.cobDias]);
-    return d > 0 && d < TH_RISK;
-  }).length;
-
-  const overCount = viewRows.filter(r => safeNum(r[m.cobDias]) > TH_OVER).length;
-
-  const smInv = viewRows.filter(r => r[m.cls] === "Sin Mov" && safeNum(r[m.inv]) > 0).length;
-
-  kpiMeses.textContent = MONTHS_USED ?? "—";
-  kpiSkus.textContent = fmtNum(viewRows.length,0);
-  kpiInv.textContent = fmtNum(invTot,0);
-  kpiProm.textContent = fmtNum(promTot,2);
-  kpiCobMed.textContent = covMed === null ? "—" : fmtNum(covMed,1);
-
-  kpiRisk.textContent = pct(riskCount, viewRows.length,1);
-  kpiOver.textContent = pct(overCount, viewRows.length,1);
-  kpiSinMovInv.textContent = fmtNum(smInv,0);
-
-  kpiA.textContent = fmtNum(countA,0);
-  kpiB.textContent = fmtNum(countB,0);
-  kpiC.textContent = fmtNum(countC,0);
-  kpiS.textContent = fmtNum(countS,0);
-}
-
-function renderHist(viewRows){
-  const wh = warehouseSelect.value;
-  const m = colMap(wh);
-
-  const buckets = [
-    { name: `0-${TH_RISK}`, from: 0, to: TH_RISK },
-    { name: "16-30", from: 15.00001, to: 30 },
-    { name: "31-60", from: 30.00001, to: 60 },
-    { name: "61-120", from: 60.00001, to: 120 },
-    { name: ">120", from: 120.00001, to: Infinity },
-  ];
-  const counts = buckets.map(()=>0);
-
-  for (const r of viewRows){
-    const d = safeNum(r[m.cobDias]);
-    for (let i=0; i<buckets.length; i++){
-      const b = buckets[i];
-      if (d >= b.from && d <= b.to){
-        counts[i] += 1;
-        break;
-      }
     }
+    frag.appendChild(tr);
   }
-
-  const ctx = document.getElementById("chartHist").getContext("2d");
-  destroyChart(chartHist);
-
-  chartHist = new Chart(ctx, {
-    type: "bar",
-    data: {
-      labels: buckets.map(b=>b.name),
-      datasets: [{ label: "SKUs", data: counts }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } }
-    }
-  });
+  tbody.appendChild(frag);
 }
 
-function renderTopLists(viewRows){
-  const wh = warehouseSelect.value;
-  const m = colMap(wh);
-
-  // Sobreinventario: altos días con inventario >0
-  const over = viewRows
-    .filter(r => safeNum(r[m.inv]) > 0)
-    .slice()
-    .sort((a,b)=> safeNum(b[m.cobDias]) - safeNum(a[m.cobDias]))
-    .slice(0, 15);
-
-  // Riesgo: días más bajos (incluye inv=0 para detectar quiebre)
-  const risk = viewRows
-    .slice()
-    .sort((a,b)=> safeNum(a[m.cobDias]) - safeNum(b[m.cobDias]))
-    .slice(0, 15);
-
-  topOver.innerHTML = "";
-  topRisk.innerHTML = "";
-
-  for (const r of over){
-    const li = document.createElement("li");
-    li.innerHTML = `<b class="mono">${r.Codigo}</b> — ${r.desc_prod} <span class="heatSmall">| inv ${fmtNum(r[m.inv],0)} | ${fmtNum(r[m.cobDias],1)} días</span>`;
-    topOver.appendChild(li);
-  }
-
-  for (const r of risk){
-    const li = document.createElement("li");
-    li.innerHTML = `<b class="mono">${r.Codigo}</b> — ${r.desc_prod} <span class="heatSmall">| inv ${fmtNum(r[m.inv],0)} | ${fmtNum(r[m.cobDias],1)} días</span>`;
-    topRisk.appendChild(li);
-  }
-}
-
-function exportViewToCSV(viewRows){
-  const wh = warehouseSelect.value;
-  const cols = getViewColumns(wh);
-
-  const header = cols.map(c => c.label);
-  const lines = [header.join(",")];
-
-  for (const r of viewRows){
-    const row = cols.map(c => {
-      let val = r[c.key];
-      if (val === null || val === undefined) val = "";
-      const s = String(val).replace(/"/g,'""');
-      return (s.includes(",") || s.includes("\n")) ? `"${s}"` : s;
-    });
-    lines.push(row.join(","));
-  }
-
-  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+function downloadCSV(filename, columns, rows){
+  const header = columns.map(c => `"${String(c.label).replace(/"/g,'""')}"`).join(",");
+  const lines = rows.map(r => columns.map(c=>{
+    const raw = r[c.key];
+    const val = raw === null || raw === undefined ? "" : String(raw);
+    return `"${val.replace(/"/g,'""')}"`;
+  }).join(","));
+  const csv = [header, ...lines].join("\n");
+  const blob = new Blob([csv], { type:"text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `vista_${wh}.csv`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
 }
 
-// ======= Refresh Detail Pipeline =======
-function refreshDetail(){
-  if (!MASTER.length) return;
-  const filtered = applyFilters(MASTER);
-  const cols = getViewColumns(warehouseSelect.value);
-  const sorted = sortRows(filtered, cols);
-  renderTable(sorted);
-}
-
-// ======= Tabs =======
-function showSummary(){
-  summaryView.classList.remove("hidden");
-  detailView.classList.add("hidden");
-  tabSummary.classList.add("active");
-  tabDetail.classList.remove("active");
-}
-
-function showDetail(){
-  summaryView.classList.add("hidden");
-  detailView.classList.remove("hidden");
-  tabSummary.classList.remove("active");
-  tabDetail.classList.add("active");
-}
-
-// ======= Events =======
-tabSummary.addEventListener("click", () => showSummary());
-tabDetail.addEventListener("click", () => showDetail());
-
-fileInput.addEventListener("change", async (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
-
-  setStatus("Leyendo archivo…", `${file.name} • ${Math.round(file.size/1024).toLocaleString("es-MX")} KB`);
-
-  try{
-    let rows = [];
-    if (file.name.toLowerCase().endsWith(".csv")){
-      const text = await file.text();
-      rows = parseCSV(text);
-    } else {
-      const buf = await file.arrayBuffer();
-      rows = parseXLSX(buf);
-    }
-
-    rows = normalizeColumns(rows);
-    const warehouses = validateMaster(rows);
-
-    WAREHOUSES = warehouses;
-    MASTER = coerceTypes(rows, warehouses);
-
-    fillWarehouseSelect(WAREHOUSES);
-
-    // enable
-    setEnabled(true);
-    setStatus("✅ Archivo cargado correctamente",
-      `Sucursales detectadas: ${WAREHOUSES.join(", ")} • Filas (SKUs): ${MASTER.length.toLocaleString("es-MX")}`);
-
-    // reset filters
-    classSelect.value = "ALL";
-    searchInput.value = "";
-    onlyInvToggle.checked = false;
-    covMin.value = "";
-    covMax.value = "";
-    onlySinMovInv.checked = false;
-    onlyABZero.checked = false;
-
-    sortKey = null;
-    sortDir = "asc";
-
-    // render both views
-    renderSummary();
-    refreshDetail();
-
-    // default view
-    showSummary();
-
-  } catch(err){
-    console.error(err);
-    setEnabled(false);
-    setStatus("❌ No se pudo cargar el archivo", String(err?.message || err));
+/* ===================== SUMMARY COMPUTE ===================== */
+function branchListForSummary(selected){
+  if (selected && selected !== "ALL"){
+    return BRANCHES.filter(b => b.label === selected);
   }
-});
+  return BRANCHES;
+}
 
-btnClear.addEventListener("click", () => {
-  MASTER = [];
-  WAREHOUSES = [];
-  MONTHS_USED = null;
+function computeBranchStats(branchKey, filteredRows){
+  // filteredRows are outputRows (sku objects). Compute using branchKey
+  let skus = 0, invSum = 0;
+  const clsCount = { A:0, B:0, C:0, "Sin Mov":0 };
+  const clsInv = { A:0, B:0, C:0, "Sin Mov":0 };
+  const covDaysArr = [];
+  let promSum = 0;
 
-  fileInput.value = "";
-  setEnabled(false);
-  setStatus("Carga un archivo para comenzar.", "");
+  for (const sku of filteredRows){
+    const b = sku.byBranch[branchKey];
+    if (!b) continue;
+    skus += 1;
+    invSum += b.inv;
+    promSum += b.prom;
 
-  // clear tables
-  heatHead.innerHTML = "";
-  heatBody.innerHTML = "";
+    const c = safeClass(b.cls);
+    clsCount[c] = (clsCount[c] || 0) + 1;
+    clsInv[c] = (clsInv[c] || 0) + b.inv;
+
+    if (b.covDays > 0 && isFinite(b.covDays)) covDaysArr.push(b.covDays);
+  }
+
+  const covMed = median(covDaysArr);
+  const riskCount = filteredRows.filter(s => isRisk(s.byBranch[branchKey]?.covDays)).length;
+  const overCount = filteredRows.filter(s => isOver(s.byBranch[branchKey]?.covDays)).length;
+  const sinMovInv = filteredRows.filter(s => safeClass(s.byBranch[branchKey]?.cls)==="Sin Mov" && (s.byBranch[branchKey]?.inv||0)>0).length;
+
+  return {
+    skus, invSum, promSum,
+    clsCount, clsInv,
+    covMed,
+    riskCount, overCount, sinMovInv,
+    riskPct: skus ? riskCount/skus : 0,
+    overPct: skus ? overCount/skus : 0,
+  };
+}
+
+function computeGlobal(selectedSucursalLabel){
+  const rows = state.outputRows;
+  const monthsUsed = state.monthsUsed || 0;
+
+  if (!rows.length){
+    return {
+      monthsUsed, skus:0, inv:0, prom:0, covMed:0, riskPct:0, overPct:0, sinMovInv:0,
+      perBranch:[]
+    };
+  }
+
+  // executive selector:
+  if (selectedSucursalLabel && selectedSucursalLabel !== "ALL"){
+    const b = BRANCHES.find(x => x.label === selectedSucursalLabel);
+    const st = computeBranchStats(b.key, rows);
+    return {
+      monthsUsed,
+      skus: st.skus,
+      inv: st.invSum,
+      prom: st.promSum,
+      covMed: st.covMed,
+      riskPct: st.riskPct,
+      overPct: st.overPct,
+      sinMovInv: st.sinMovInv,
+      perBranch: [{ branchLabel: b.label, ...st }]
+    };
+  }
+
+  // ALL: compute per branch and also global combined
+  let invAll=0, promAll=0;
+  const covAll = [];
+  let riskAll=0, overAll=0, sinMovInvAll=0;
+  const skuCountAll = rows.length;
+
+  const perBranch = BRANCHES.map(b=>{
+    const st = computeBranchStats(b.key, rows);
+    invAll += st.invSum;
+    promAll += st.promSum;
+    if (st.covMed>0) covAll.push(st.covMed);
+    riskAll += st.riskCount;
+    overAll += st.overCount;
+    sinMovInvAll += st.sinMovInv;
+
+    return { branchLabel: b.label, ...st };
+  });
+
+  const covMedGlobal = median(covAll);
+
+  // riskPct global basado en skus totales * sucursales? NO. Usaremos promedio simple de sucursales (más útil ejecutivo).
+  const riskPct = perBranch.length ? perBranch.reduce((a,x)=>a+x.riskPct,0)/perBranch.length : 0;
+  const overPct = perBranch.length ? perBranch.reduce((a,x)=>a+x.overPct,0)/perBranch.length : 0;
+
+  return {
+    monthsUsed,
+    skus: skuCountAll,
+    inv: invAll,
+    prom: promAll,
+    covMed: covMedGlobal,
+    riskPct, overPct,
+    sinMovInv: sinMovInvAll,
+    perBranch
+  };
+}
+
+/* ===================== CHARTS ===================== */
+function destroyChart(ch){
+  if (ch && typeof ch.destroy === "function") ch.destroy();
+}
+
+function renderSummaryCharts(perBranch){
+  // stacked classification 100% (by sku count)
+  const labels = perBranch.map(x=>x.branchLabel);
+  const A = perBranch.map(x => x.skus ? (x.clsCount.A/x.skus)*100 : 0);
+  const B = perBranch.map(x => x.skus ? (x.clsCount.B/x.skus)*100 : 0);
+  const C = perBranch.map(x => x.skus ? (x.clsCount.C/x.skus)*100 : 0);
+  const S = perBranch.map(x => x.skus ? (x.clsCount["Sin Mov"]/x.skus)*100 : 0);
+
+  destroyChart(state.charts.stacked);
+  state.charts.stacked = new Chart($("chartStacked"), {
+    type:"bar",
+    data:{
+      labels,
+      datasets:[
+        { label:"A", data:A, stack:"s" },
+        { label:"B", data:B, stack:"s" },
+        { label:"C", data:C, stack:"s" },
+        { label:"Sin Mov", data:S, stack:"s" },
+      ]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      scales:{
+        x:{ stacked:true, ticks:{ color:"#9fb1d1" }, grid:{ color:"rgba(255,255,255,.06)" } },
+        y:{ stacked:true, ticks:{ color:"#9fb1d1", callback:(v)=>v+"%" }, grid:{ color:"rgba(255,255,255,.06)" }, max:100 }
+      },
+      plugins:{
+        legend:{ labels:{ color:"#e9f0ff" } },
+        tooltip:{ callbacks:{ label:(ctx)=>`${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}%` } }
+      }
+    }
+  });
+
+  // risk/over
+  const risk = perBranch.map(x => x.riskPct*100);
+  const over = perBranch.map(x => x.overPct*100);
+
+  destroyChart(state.charts.riskOver);
+  state.charts.riskOver = new Chart($("chartRiskOver"), {
+    type:"bar",
+    data:{
+      labels,
+      datasets:[
+        { label:"Riesgo (<15)", data:risk },
+        { label:"Sobreinv (>60)", data:over }
+      ]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      scales:{
+        x:{ ticks:{ color:"#9fb1d1" }, grid:{ color:"rgba(255,255,255,.06)" } },
+        y:{ ticks:{ color:"#9fb1d1", callback:(v)=>v+"%" }, grid:{ color:"rgba(255,255,255,.06)" } }
+      },
+      plugins:{ legend:{ labels:{ color:"#e9f0ff" } } }
+    }
+  });
+}
+
+function renderDetailChart(distBuckets){
+  destroyChart(state.charts.dist);
+  state.charts.dist = new Chart($("chartHist"), {
+    type:"bar",
+    data:{
+      labels: distBuckets.map(b=>b.label),
+      datasets:[{ label:"SKUs", data: distBuckets.map(b=>b.count) }]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      scales:{
+        x:{ ticks:{ color:"#9fb1d1" }, grid:{ color:"rgba(255,255,255,.06)" } },
+        y:{ ticks:{ color:"#9fb1d1" }, grid:{ color:"rgba(255,255,255,.06)" } },
+      },
+      plugins:{ legend:{ labels:{ color:"#e9f0ff" } } }
+    }
+  });
+}
+
+/* ===================== RENDER SUMMARY ===================== */
+function renderHeatTable(perBranch){
+  const table = $("heatTable");
+  const columns = [
+    { key:"branchLabel", label:"Sucursal" },
+    { key:"skus", label:"SKUs" , fmt:(v)=>formatInt(v)},
+    { key:"invSum", label:"Inv (pzs)", fmt:(v)=>formatInt(v) },
+    { key:"covMed", label:"Cob Med (días)", fmt:(v)=>formatNoDecimals(v) },
+    { key:"A", label:"A (SKUs / pzs)", fmt:(v,r)=>`${formatInt(r.clsCount.A)} | ${formatInt(r.clsInv.A)}` },
+    { key:"B", label:"B (SKUs / pzs)", fmt:(v,r)=>`${formatInt(r.clsCount.B)} | ${formatInt(r.clsInv.B)}` },
+    { key:"C", label:"C (SKUs / pzs)", fmt:(v,r)=>`${formatInt(r.clsCount.C)} | ${formatInt(r.clsInv.C)}` },
+    { key:"S", label:"Sin Mov (SKUs / pzs)", fmt:(v,r)=>`${formatInt(r.clsCount["Sin Mov"])} | ${formatInt(r.clsInv["Sin Mov"])}` },
+    { key:"riskPct", label:"Riesgo %", fmt:(v)=>pct(v) },
+    { key:"overPct", label:"Sobreinv %", fmt:(v)=>pct(v) },
+  ];
+
+  const rows = perBranch.map(x=>({
+    branchLabel:x.branchLabel,
+    skus:x.skus,
+    invSum:x.invSum,
+    covMed:x.covMed,
+    clsCount:x.clsCount,
+    clsInv:x.clsInv,
+    riskPct:x.riskPct,
+    overPct:x.overPct,
+  }));
+
+  renderTable(table, columns, rows, null);
+}
+
+function renderRankings(perBranch){
+  const riskRank = [...perBranch].sort((a,b)=>b.riskPct-a.riskPct).slice(0,5);
+  const overRank = [...perBranch].sort((a,b)=>b.overPct-a.overPct).slice(0,5);
+
+  $("rankRisk").innerHTML = riskRank.map(x=>`<li>${x.branchLabel}: <b>${pct(x.riskPct)}</b> (SKUs: ${formatInt(x.riskCount)})</li>`).join("");
+  $("rankOver").innerHTML = overRank.map(x=>`<li>${x.branchLabel}: <b>${pct(x.overPct)}</b> (SKUs: ${formatInt(x.overCount)})</li>`).join("");
+}
+
+function renderInsights(global){
+  const items = [];
+  if (!global.perBranch.length){
+    $("insights").innerHTML = "";
+    return;
+  }
+
+  if (global.perBranch.length === 1){
+    const b = global.perBranch[0];
+    items.push(`Sucursal <b>${b.branchLabel}</b>: Riesgo <b>${pct(b.riskPct)}</b> • Sobreinv <b>${pct(b.overPct)}</b> • Sin Mov con inv <b>${formatInt(b.sinMovInv)}</b>.`);
+    items.push(`Cobertura mediana <b>${formatNoDecimals(b.covMed)} días</b> con inventario total <b>${formatInt(b.invSum)}</b> piezas.`);
+  } else {
+    const topRisk = [...global.perBranch].sort((a,b)=>b.riskPct-a.riskPct)[0];
+    const topOver = [...global.perBranch].sort((a,b)=>b.overPct-a.overPct)[0];
+    items.push(`Mayor Riesgo (<15 días): <b>${topRisk.branchLabel}</b> con <b>${pct(topRisk.riskPct)}</b>.`);
+    items.push(`Mayor Sobreinventario (>60 días): <b>${topOver.branchLabel}</b> con <b>${pct(topOver.overPct)}</b>.`);
+    items.push(`Cobertura global (mediana de sucursales): <b>${formatNoDecimals(global.covMed)} días</b>.`);
+  }
+
+  $("insights").innerHTML = items.map(t=>`<li>${t}</li>`).join("");
+}
+
+function renderSummary(){
+  if (!state.loaded) return;
+
+  const selected = $("summaryWarehouseSelect").value || "ALL";
+  const g = computeGlobal(selected);
+
+  $("gMeses").textContent = String(g.monthsUsed || 0);
+  $("gSkus").textContent = formatInt(g.skus || 0);
+  $("gInv").textContent = formatInt(g.inv || 0);
+  $("gCobDias").textContent = formatNoDecimals(g.covMed || 0);
+  $("gPromMes").textContent = formatProm(g.prom || 0);
+  $("gRiskPct").textContent = pct(g.riskPct || 0);
+  $("gOverPct").textContent = pct(g.overPct || 0);
+  $("gSinMovInv").textContent = formatInt(g.sinMovInv || 0);
+
+  renderSummaryCharts(g.perBranch);
+  renderHeatTable(g.perBranch);
+  renderRankings(g.perBranch);
+  renderInsights(g);
+}
+
+/* ===================== DETAIL VIEW ===================== */
+function getDetailFilters(){
+  const branch = $("warehouseSelect").value;
+  const cls = $("classSelect").value;
+  const q = String($("searchInput").value||"").trim().toUpperCase();
+  const onlyInv = $("onlyInvToggle").checked;
+  const min = $("covMin").value ? toNumber($("covMin").value) : null;
+  const max = $("covMax").value ? toNumber($("covMax").value) : null;
+  const onlySinMovInv = $("onlySinMovInv").checked;
+  const onlyABZero = $("onlyABZero").checked;
+
+  return { branch, cls, q, onlyInv, min, max, onlySinMovInv, onlyABZero };
+}
+
+function buildDetailRows(){
+  const f = getDetailFilters();
+  const b = BRANCHES.find(x=>x.label === f.branch) || BRANCHES[0];
+
+  let rows = state.outputRows.map(sku=>{
+    const bb = sku.byBranch[b.key];
+    return {
+      codigo: sku.codigo,
+      desc: sku.desc,
+      inv: bb.inv,
+      cls: safeClass(bb.cls),
+      prom: bb.prom,
+      covMes: bb.covMes,
+      covDays: bb.covDays,
+      risk: isRisk(bb.covDays) ? 1 : 0,
+      over: isOver(bb.covDays) ? 1 : 0,
+    };
+  });
+
+  if (f.q){
+    rows = rows.filter(r => (r.codigo||"").toUpperCase().includes(f.q) || (r.desc||"").toUpperCase().includes(f.q));
+  }
+  if (f.cls !== "ALL"){
+    rows = rows.filter(r => r.cls === f.cls);
+  }
+  if (f.onlyInv){
+    rows = rows.filter(r => r.inv > 0);
+  }
+  if (f.onlySinMovInv){
+    rows = rows.filter(r => r.cls === "Sin Mov" && r.inv > 0);
+  }
+  if (f.onlyABZero){
+    rows = rows.filter(r => (r.cls === "A" || r.cls === "B") && r.inv === 0);
+  }
+  if (f.min !== null){
+    rows = rows.filter(r => toNumber(r.covDays) >= f.min);
+  }
+  if (f.max !== null){
+    rows = rows.filter(r => toNumber(r.covDays) <= f.max);
+  }
+
+  // default sort by covDays desc
+  const sortKey = state.detail.sortKey || "covDays";
+  rows = sortRows(rows, sortKey, state.detail.sortDir || "desc");
+  return rows;
+}
+
+function renderDetailKPIs(rows){
+  const meses = state.monthsUsed || 0;
+  $("kpiMeses").textContent = String(meses);
+  $("kpiSkus").textContent = formatInt(rows.length);
+  $("kpiInv").textContent = formatInt(rows.reduce((a,r)=>a+r.inv,0));
+
+  const covArr = rows.map(r=>r.covDays).filter(x=>x>0 && isFinite(x));
+  $("kpiCobMed").textContent = formatNoDecimals(median(covArr));
+
+  $("kpiProm").textContent = formatProm(rows.reduce((a,r)=>a+r.prom,0));
+  const risk = rows.filter(r=>isRisk(r.covDays)).length;
+  const over = rows.filter(r=>isOver(r.covDays)).length;
+  $("kpiRisk").textContent = rows.length ? pct(risk/rows.length) : "0%";
+  $("kpiOver").textContent = rows.length ? pct(over/rows.length) : "0%";
+
+  const sinMovInv = rows.filter(r=>r.cls==="Sin Mov" && r.inv>0).length;
+  $("kpiSinMovInv").textContent = formatInt(sinMovInv);
+
+  $("kpiA").textContent = formatInt(rows.filter(r=>r.cls==="A").length);
+  $("kpiB").textContent = formatInt(rows.filter(r=>r.cls==="B").length);
+  $("kpiC").textContent = formatInt(rows.filter(r=>r.cls==="C").length);
+  $("kpiS").textContent = formatInt(rows.filter(r=>r.cls==="Sin Mov").length);
+}
+
+function renderDetailTop(rows){
+  const over = [...rows].sort((a,b)=>b.covDays-a.covDays).slice(0,15);
+  const risk = [...rows].filter(r=>r.covDays>0).sort((a,b)=>a.covDays-b.covDays).slice(0,15);
+
+  $("topOver").innerHTML = over.map(r=>`<li><b>${r.codigo}</b> — ${r.desc} <span class="muted">(${formatNoDecimals(r.covDays)} días, inv ${formatInt(r.inv)})</span></li>`).join("");
+  $("topRisk").innerHTML = risk.map(r=>`<li><b>${r.codigo}</b> — ${r.desc} <span class="muted">(${formatNoDecimals(r.covDays)} días, inv ${formatInt(r.inv)})</span></li>`).join("");
+}
+
+function renderDetail(){
+  if (!state.loaded) return;
+
+  const rows = buildDetailRows();
+  renderDetailKPIs(rows);
+
+  const buckets = [
+    { label:"0–15", min:0, max:15, count:0 },
+    { label:"16–30", min:16, max:30, count:0 },
+    { label:"31–60", min:31, max:60, count:0 },
+    { label:"61–120", min:61, max:120, count:0 },
+    { label:">120", min:121, max:1e12, count:0 },
+  ];
+  for (const r of rows){
+    const d = toNumber(r.covDays);
+    if (!d || d <= 0) continue;
+    const b = buckets.find(x=>d>=x.min && d<=x.max) || buckets[buckets.length-1];
+    b.count += 1;
+  }
+  renderDetailChart(buckets);
+  renderDetailTop(rows);
+
+  const cols = [
+    { key:"codigo", label:"Código" },
+    { key:"desc", label:"Descripción" },
+    { key:"cls", label:"Clasificación" },
+    { key:"inv", label:"Inv", fmt:(v)=>formatInt(v) },
+    { key:"prom", label:"Prom Vta Mes", fmt:(v)=>formatProm(v) },
+    { key:"covMes", label:"Cobertura (Mes)", fmt:(v)=>formatNoDecimals(v) },
+    { key:"covDays", label:"Cobertura (Días)", fmt:(v)=>formatNoDecimals(v) },
+  ];
+
+  // pagination
+  state.detail.pageSize = parseInt($("detailPageSize").value || "100",10);
+  const pg = paginate(rows, state.detail.page, state.detail.pageSize);
+  state.detail.page = pg.page;
+
+  $("detailPageInfo").textContent = `Página ${pg.page} de ${pg.pages} • ${formatInt(pg.total)} filas`;
+  $("detailPrev").disabled = pg.page <= 1;
+  $("detailNext").disabled = pg.page >= pg.pages;
+
+  const onSort = (key)=>{
+    if (state.detail.sortKey === key){
+      state.detail.sortDir = state.detail.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.detail.sortKey = key;
+      state.detail.sortDir = "asc";
+    }
+    state.detail.page = 1;
+    renderDetail();
+  };
+
+  renderTable($("dataTable"), cols, pg.slice, onSort);
+
+  $("tableHint").textContent = `Sucursal ${$("warehouseSelect").value} • Filtros aplicados`;
+
+  // export current filtered rows (no pagination)
+  $("btnExport").onclick = ()=> downloadCSV(`detalle_${$("warehouseSelect").value}.csv`, cols, rows);
+}
+
+/* ===================== FINDER VIEW ===================== */
+function buildFinderRows(){
+  const q = String($("finderSearch").value||"").trim().toUpperCase();
+  const onlyInv = $("finderOnlyInv").checked;
+
+  let rows = state.outputRows.map(sku=>{
+    const r = { codigo: sku.codigo, desc: sku.desc };
+    let anyInv = false;
+    for (const b of BRANCHES){
+      const bb = sku.byBranch[b.key];
+      r[`cls_${b.key}`] = safeClass(bb.cls);
+      r[`inv_${b.key}`] = bb.inv;
+      if (bb.inv > 0) anyInv = true;
+    }
+    r.anyInv = anyInv ? 1 : 0;
+    return r;
+  });
+
+  if (q){
+    rows = rows.filter(r => r.codigo.toUpperCase().includes(q) || r.desc.toUpperCase().includes(q));
+  }
+  if (onlyInv){
+    rows = rows.filter(r => r.anyInv === 1);
+  }
+
+  const sortKey = state.finder.sortKey || "codigo";
+  rows = sortRows(rows, sortKey, state.finder.sortDir || "asc");
+  return rows;
+}
+
+function renderFinder(){
+  const rows = buildFinderRows();
+
+  const cols = [
+    { key:"codigo", label:"Código" },
+    { key:"desc", label:"Descripción" },
+    ...BRANCHES.flatMap(b=>[
+      { key:`cls_${b.key}`, label:`Clasif ${b.label}` },
+      { key:`inv_${b.key}`, label:`Inv ${b.label}`, fmt:(v)=>formatInt(v) },
+    ]),
+  ];
+
+  state.finder.pageSize = parseInt($("finderPageSize").value || "100",10);
+  const pg = paginate(rows, state.finder.page, state.finder.pageSize);
+  state.finder.page = pg.page;
+
+  $("finderPageInfo").textContent = `Página ${pg.page} de ${pg.pages} • ${formatInt(pg.total)} filas`;
+  $("finderPrev").disabled = pg.page <= 1;
+  $("finderNext").disabled = pg.page >= pg.pages;
+
+  const onSort = (key)=>{
+    if (state.finder.sortKey === key){
+      state.finder.sortDir = state.finder.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.finder.sortKey = key;
+      state.finder.sortDir = "asc";
+    }
+    state.finder.page = 1;
+    renderFinder();
+  };
+
+  renderTable($("finderTable"), cols, pg.slice, onSort);
+
+  $("finderExport").onclick = ()=> downloadCSV("buscador_sku.csv", cols, rows);
+}
+
+/* ===================== OPORTUNIDADES (QUiebres) ===================== */
+function computeOppBreak(targetLabel, onlyRisk){
+  const target = BRANCHES.find(b=>b.label===targetLabel) || BRANCHES[0];
+
+  const out = [];
+
+  for (const sku of state.outputRows){
+    const t = sku.byBranch[target.key];
+    const tCls = safeClass(t.cls);
+    if (!(tCls==="A" || tCls==="B")) continue;
+
+    const tCov = toNumber(t.covDays);
+    const tRisk = isRisk(tCov) || t.inv === 0;
+
+    if (onlyRisk && !tRisk) continue;
+
+    // deficit to reach TARGET_RISK_DAYS
+    const daily = (t.prom > 0) ? (t.prom/30) : 0;
+    if (daily <= 0) continue; // sin velocidad de venta no sugerimos
+
+    const required = daily * TARGET_RISK_DAYS;
+    const deficit = Math.max(0, required - t.inv);
+    if (deficit <= 0) continue;
+
+    const donors = [];
+    for (const b of BRANCHES){
+      if (b.key === target.key) continue;
+      const bb = sku.byBranch[b.key];
+      const c = safeClass(bb.cls);
+      if ((c==="C" || c==="Sin Mov") && bb.inv > 0){
+        donors.push({
+          branch: b.label,
+          inv: bb.inv,
+          cls: c,
+          covDays: bb.covDays
+        });
+      }
+    }
+    if (!donors.length) continue;
+
+    // allocate from donors (simple: highest inv first)
+    donors.sort((a,b)=>b.inv-a.inv);
+    let remaining = deficit;
+    const alloc = {};
+    for (const d of donors){
+      if (remaining <= 0) break;
+      const take = Math.min(d.inv, remaining);
+      alloc[d.branch] = take;
+      remaining -= take;
+    }
+    const suggested = deficit - remaining;
+
+    out.push({
+      codigo: sku.codigo,
+      desc: sku.desc,
+      targetSucursal: target.label,
+      targetCls: tCls,
+      targetInv: t.inv,
+      targetCov: tCov,
+      targetProm: t.prom,
+      deficit: deficit,
+      sugerido: suggested,
+      ...donors.reduce((acc,d)=>{
+        acc[`don_cls_${d.branch}`] = d.cls;
+        acc[`don_inv_${d.branch}`] = d.inv;
+        acc[`don_take_${d.branch}`] = alloc[d.branch] || 0;
+        return acc;
+      },{})
+    });
+  }
+
+  // sort: highest deficit first
+  return out.sort((a,b)=>b.deficit-a.deficit);
+}
+
+function renderOppBreak(){
+  const target = $("oppBreakTarget").value;
+  const onlyRisk = $("oppBreakOnlyRisk").checked;
+
+  const rows = computeOppBreak(target, onlyRisk);
+
+  // columns
+  const donorBranches = BRANCHES.filter(b=>b.label!==target);
+  const cols = [
+    { key:"codigo", label:"Código" },
+    { key:"desc", label:"Descripción" },
+    { key:"targetCls", label:"Cls Obj" },
+    { key:"targetInv", label:"Inv Obj", fmt:(v)=>formatInt(v) },
+    { key:"targetCov", label:"Cob Obj (días)", fmt:(v)=>formatNoDecimals(v) },
+    { key:"deficit", label:"Déficit (pzs)", fmt:(v)=>formatInt(v) },
+    { key:"sugerido", label:"Sugerido traslado", fmt:(v)=>formatInt(v) },
+    ...donorBranches.flatMap(b=>[
+      { key:`don_cls_${b.label}`, label:`Cls ${b.label}` },
+      { key:`don_inv_${b.label}`, label:`Inv ${b.label}`, fmt:(v)=>formatInt(v) },
+      { key:`don_take_${b.label}`, label:`Tomar ${b.label}`, fmt:(v)=>formatInt(v) },
+    ]),
+  ];
+
+  state.oppBreak.pageSize = parseInt($("oppBreakPageSize").value || "100",10);
+  const pg = paginate(rows, state.oppBreak.page, state.oppBreak.pageSize);
+  state.oppBreak.page = pg.page;
+
+  $("oppBreakPageInfo").textContent = `Página ${pg.page} de ${pg.pages} • ${formatInt(pg.total)} filas`;
+  $("oppBreakPrev").disabled = pg.page <= 1;
+  $("oppBreakNext").disabled = pg.page >= pg.pages;
+
+  const onSort = (key)=>{
+    if (state.oppBreak.sortKey === key){
+      state.oppBreak.sortDir = state.oppBreak.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.oppBreak.sortKey = key;
+      state.oppBreak.sortDir = "asc";
+    }
+    state.oppBreak.page = 1;
+    const sorted = sortRows(rows, state.oppBreak.sortKey, state.oppBreak.sortDir);
+    const pg2 = paginate(sorted, state.oppBreak.page, state.oppBreak.pageSize);
+    renderTable($("oppBreakTable"), cols, pg2.slice, onSort);
+  };
+
+  renderTable($("oppBreakTable"), cols, pg.slice, onSort);
+
+  $("oppBreakExport").onclick = ()=> downloadCSV(`oportunidades_quiebres_${target}.csv`, cols, rows);
+}
+
+/* ===================== OPORTUNIDADES (Sobreinv) ===================== */
+function computeOppOver(targetLabel, onlyOver){
+  const target = BRANCHES.find(b=>b.label===targetLabel) || BRANCHES[0];
+  const out = [];
+
+  for (const sku of state.outputRows){
+    const t = sku.byBranch[target.key];
+    const tCls = safeClass(t.cls);
+    if (!(tCls==="C" || tCls==="Sin Mov")) continue;
+
+    const tCov = toNumber(t.covDays);
+    const isOverHere = isOver(tCov);
+
+    if (onlyOver && !isOverHere) continue;
+    if (t.inv <= 0) continue;
+
+    // exceso objetivo: inv - daily*TARGET_OVER_DAYS
+    const daily = (t.prom > 0) ? (t.prom/30) : 0;
+    const excess = daily > 0 ? Math.max(0, t.inv - daily*TARGET_OVER_DAYS) : t.inv;
+    if (excess <= 0) continue;
+
+    // receptores: sucursales con A/B (idealmente riesgo)
+    const receivers = [];
+    for (const b of BRANCHES){
+      if (b.key === target.key) continue;
+      const bb = sku.byBranch[b.key];
+      const c = safeClass(bb.cls);
+      if (c==="A" || c==="B"){
+        const dailyR = (bb.prom > 0) ? (bb.prom/30) : 0;
+        const deficitR = dailyR > 0 ? Math.max(0, dailyR*TARGET_RISK_DAYS - bb.inv) : 0;
+        receivers.push({
+          branch: b.label,
+          cls: c,
+          inv: bb.inv,
+          covDays: bb.covDays,
+          deficit: deficitR
+        });
+      }
+    }
+    if (!receivers.length) continue;
+
+    // allocate excess to highest deficit first
+    receivers.sort((a,b)=>b.deficit-a.deficit);
+    let remaining = excess;
+    const alloc = {};
+    for (const r of receivers){
+      if (remaining <= 0) break;
+      const take = Math.min(remaining, Math.max(0, r.deficit || 0));
+      if (take > 0){
+        alloc[r.branch] = take;
+        remaining -= take;
+      }
+    }
+    const suggested = excess - remaining;
+
+    out.push({
+      codigo: sku.codigo,
+      desc: sku.desc,
+      targetSucursal: target.label,
+      targetCls: tCls,
+      targetInv: t.inv,
+      targetCov: tCov,
+      excess: excess,
+      sugerido: suggested,
+      ...receivers.reduce((acc,r)=>{
+        acc[`rec_cls_${r.branch}`] = r.cls;
+        acc[`rec_inv_${r.branch}`] = r.inv;
+        acc[`rec_need_${r.branch}`] = r.deficit || 0;
+        acc[`rec_send_${r.branch}`] = alloc[r.branch] || 0;
+        return acc;
+      },{})
+    });
+  }
+
+  return out.sort((a,b)=>b.excess-a.excess);
+}
+
+function renderOppOver(){
+  const target = $("oppOverTarget").value;
+  const onlyOver = $("oppOverOnlyOver").checked;
+
+  const rows = computeOppOver(target, onlyOver);
+
+  const receiverBranches = BRANCHES.filter(b=>b.label!==target);
+  const cols = [
+    { key:"codigo", label:"Código" },
+    { key:"desc", label:"Descripción" },
+    { key:"targetCls", label:"Cls Obj" },
+    { key:"targetInv", label:"Inv Obj", fmt:(v)=>formatInt(v) },
+    { key:"targetCov", label:"Cob Obj (días)", fmt:(v)=>formatNoDecimals(v) },
+    { key:"excess", label:"Exceso (pzs)", fmt:(v)=>formatInt(v) },
+    { key:"sugerido", label:"Sugerido mover", fmt:(v)=>formatInt(v) },
+    ...receiverBranches.flatMap(b=>[
+      { key:`rec_cls_${b.label}`, label:`Cls ${b.label}` },
+      { key:`rec_inv_${b.label}`, label:`Inv ${b.label}`, fmt:(v)=>formatInt(v) },
+      { key:`rec_need_${b.label}`, label:`Necesita ${b.label}`, fmt:(v)=>formatInt(v) },
+      { key:`rec_send_${b.label}`, label:`Enviar ${b.label}`, fmt:(v)=>formatInt(v) },
+    ]),
+  ];
+
+  state.oppOver.pageSize = parseInt($("oppOverPageSize").value || "100",10);
+  const pg = paginate(rows, state.oppOver.page, state.oppOver.pageSize);
+  state.oppOver.page = pg.page;
+
+  $("oppOverPageInfo").textContent = `Página ${pg.page} de ${pg.pages} • ${formatInt(pg.total)} filas`;
+  $("oppOverPrev").disabled = pg.page <= 1;
+  $("oppOverNext").disabled = pg.page >= pg.pages;
+
+  const onSort = (key)=>{
+    if (state.oppOver.sortKey === key){
+      state.oppOver.sortDir = state.oppOver.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.oppOver.sortKey = key;
+      state.oppOver.sortDir = "asc";
+    }
+    state.oppOver.page = 1;
+    const sorted = sortRows(rows, state.oppOver.sortKey, state.oppOver.sortDir);
+    const pg2 = paginate(sorted, state.oppOver.page, state.oppOver.pageSize);
+    renderTable($("oppOverTable"), cols, pg2.slice, onSort);
+  };
+
+  renderTable($("oppOverTable"), cols, pg.slice, onSort);
+
+  $("oppOverExport").onclick = ()=> downloadCSV(`oportunidades_sobreinv_${target}.csv`, cols, rows);
+}
+
+/* ===================== HISTORICOS ===================== */
+function filterHist(rows, sucursalSel, text, from, to){
+  const q = String(text||"").trim().toUpperCase();
+  const f = String(from||"").trim();
+  const t = String(to||"").trim();
+
+  return rows.filter(r=>{
+    if (sucursalSel && sucursalSel !== "ALL" && r.sucursal !== sucursalSel) return false;
+    if (q && !r.item.toUpperCase().includes(q)) return false;
+    if (f && r.mes < f) return false;
+    if (t && r.mes > t) return false;
+    return true;
+  });
+}
+
+function buildPivot(rows){
+  // rows: {mes, sucursal, monto, litros} already filtered
+  const meses = [...new Set(rows.map(r=>r.mes))].sort();
+  const sucs = [...new Set(rows.map(r=>r.sucursal))].sort((a,b)=>a.localeCompare(b,"es",{sensitivity:"base"}));
+
+  const money = {};
+  const litros = {};
+
+  for (const m of meses){
+    money[m] = {};
+    litros[m] = {};
+    for (const s of sucs){
+      money[m][s] = 0;
+      litros[m][s] = 0;
+    }
+  }
+
+  for (const r of rows){
+    if (!money[r.mes]) continue;
+    money[r.mes][r.sucursal] += toNumber(r.monto);
+    litros[r.mes][r.sucursal] += toNumber(r.litros);
+  }
+
+  return { meses, sucs, money, litros };
+}
+
+function renderPivotTable(tableEl, pivot, kind /* "money"|"litros" */){
+  const { meses, sucs } = pivot;
+  const data = kind === "money" ? pivot.money : pivot.litros;
+
+  const thead = tableEl.querySelector("thead");
+  const tbody = tableEl.querySelector("tbody");
   thead.innerHTML = "";
   tbody.innerHTML = "";
-  rankRisk.innerHTML = "";
-  rankOver.innerHTML = "";
-  insights.innerHTML = "";
-  topOver.innerHTML = "";
-  topRisk.innerHTML = "";
-  tableHint.textContent = "—";
 
-  // clear kpis
-  [gMeses,gSkus,gInv,gCobDias,gPromMes,gRiskPct,gOverPct,gSinMovInv].forEach(x=>x.textContent="—");
-  [kpiMeses,kpiSkus,kpiInv,kpiCobMed,kpiProm,kpiRisk,kpiOver,kpiSinMovInv,kpiA,kpiB,kpiC,kpiS].forEach(x=>x.textContent="—");
+  const trh = document.createElement("tr");
+  const th0 = document.createElement("th");
+  th0.textContent = "Mes";
+  trh.appendChild(th0);
+  for (const s of sucs){
+    const th = document.createElement("th");
+    th.textContent = s;
+    trh.appendChild(th);
+  }
+  const thT = document.createElement("th");
+  thT.textContent = "TOTAL";
+  trh.appendChild(thT);
+  thead.appendChild(trh);
 
-  destroyChart(chartStacked); chartStacked=null;
-  destroyChart(chartRiskOver); chartRiskOver=null;
-  destroyChart(chartHist); chartHist=null;
+  const frag = document.createDocumentFragment();
+  for (const m of meses){
+    const tr = document.createElement("tr");
+    const td0 = document.createElement("td");
+    td0.textContent = m;
+    tr.appendChild(td0);
 
-  showSummary();
-});
+    let total = 0;
+    for (const s of sucs){
+      const v = toNumber(data[m][s] || 0);
+      total += v;
+      const td = document.createElement("td");
+      td.textContent = kind === "money" ? formatMoney(v) : formatInt(v);
+      tr.appendChild(td);
+    }
+    const tdT = document.createElement("td");
+    tdT.textContent = kind === "money" ? formatMoney(total) : formatInt(total);
+    tr.appendChild(tdT);
 
-warehouseSelect.addEventListener("change", () => { sortKey=null; sortDir="asc"; refreshDetail(); });
-classSelect.addEventListener("change", refreshDetail);
-searchInput.addEventListener("input", debounce(refreshDetail, 140));
-onlyInvToggle.addEventListener("change", refreshDetail);
-covMin.addEventListener("input", debounce(refreshDetail, 180));
-covMax.addEventListener("input", debounce(refreshDetail, 180));
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+}
 
-onlySinMovInv.addEventListener("change", () => {
-  // si activas SinMovInv, apaga ABZero para evitar conflicto
-  if (onlySinMovInv.checked) onlyABZero.checked = false;
-  refreshDetail();
-});
-onlyABZero.addEventListener("change", () => {
-  if (onlyABZero.checked) onlySinMovInv.checked = false;
-  refreshDetail();
-});
+function renderHistDetail(tableEl, rows, mode, onSort){
+  const cols = [
+    { key:"mes", label:"Mes" },
+    { key:"sucursal", label:"Sucursal" },
+    { key:"item", label: mode === "CATEG" ? "Categoría" : "Marca" },
+    { key:"monto", label:"Monto_venta", fmt:(v)=>formatMoney(v) },
+    { key:"litros", label:"Litros Vendidos", fmt:(v)=>formatInt(v) },
+  ];
+  renderTable(tableEl, cols, rows, onSort);
+  return cols;
+}
 
-btnExport.addEventListener("click", () => {
-  const view = sortRows(applyFilters(MASTER), getViewColumns(warehouseSelect.value));
-  exportViewToCSV(view);
-});
+function renderHistCateg(){
+  const suc = $("histCategSucursal").value;
+  const q = $("histCategSearch").value;
+  const from = $("histCategFrom").value;
+  const to = $("histCategTo").value;
 
-// Initial state
-setEnabled(false);
-showSummary();
+  const filtered = filterHist(state.histCateg, suc, q, from, to);
+
+  // pivots (dependen del filtro)
+  const pivot = buildPivot(filtered);
+  renderPivotTable($("histCategPivotMoney"), pivot, "money");
+  renderPivotTable($("histCategPivotLitros"), pivot, "litros");
+
+  // detalle + pagination
+  const sortKey = state.histCategUI.sortKey || "monto";
+  const sorted = sortRows(filtered.map(r=>({ ...r })), sortKey, state.histCategUI.sortDir || "desc");
+
+  state.histCategUI.pageSize = parseInt($("histCategPageSize").value || "100",10);
+  const pg = paginate(sorted, state.histCategUI.page, state.histCategUI.pageSize);
+  state.histCategUI.page = pg.page;
+
+  $("histCategPageInfo").textContent = `Página ${pg.page} de ${pg.pages} • ${formatInt(pg.total)} filas`;
+  $("histCategPrev").disabled = pg.page <= 1;
+  $("histCategNext").disabled = pg.page >= pg.pages;
+
+  const onSort = (key)=>{
+    if (state.histCategUI.sortKey === key){
+      state.histCategUI.sortDir = state.histCategUI.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.histCategUI.sortKey = key;
+      state.histCategUI.sortDir = "asc";
+    }
+    state.histCategUI.page = 1;
+    renderHistCateg();
+  };
+
+  const cols = renderHistDetail($("histCategDetail"), pg.slice, "CATEG", onSort);
+
+  $("histCategExport").onclick = ()=> downloadCSV("historico_categorias_detalle.csv", cols, filtered);
+}
+
+function renderHistMarca(){
+  const suc = $("histMarcaSucursal").value;
+  const q = $("histMarcaSearch").value;
+  const from = $("histMarcaFrom").value;
+  const to = $("histMarcaTo").value;
+
+  const filtered = filterHist(state.histMarca, suc, q, from, to);
+
+  const pivot = buildPivot(filtered);
+  renderPivotTable($("histMarcaPivotMoney"), pivot, "money");
+  renderPivotTable($("histMarcaPivotLitros"), pivot, "litros");
+
+  const sortKey = state.histMarcaUI.sortKey || "monto";
+  const sorted = sortRows(filtered.map(r=>({ ...r })), sortKey, state.histMarcaUI.sortDir || "desc");
+
+  state.histMarcaUI.pageSize = parseInt($("histMarcaPageSize").value || "100",10);
+  const pg = paginate(sorted, state.histMarcaUI.page, state.histMarcaUI.pageSize);
+  state.histMarcaUI.page = pg.page;
+
+  $("histMarcaPageInfo").textContent = `Página ${pg.page} de ${pg.pages} • ${formatInt(pg.total)} filas`;
+  $("histMarcaPrev").disabled = pg.page <= 1;
+  $("histMarcaNext").disabled = pg.page >= pg.pages;
+
+  const onSort = (key)=>{
+    if (state.histMarcaUI.sortKey === key){
+      state.histMarcaUI.sortDir = state.histMarcaUI.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.histMarcaUI.sortKey = key;
+      state.histMarcaUI.sortDir = "asc";
+    }
+    state.histMarcaUI.page = 1;
+    renderHistMarca();
+  };
+
+  const cols = renderHistDetail($("histMarcaDetail"), pg.slice, "MARCA", onSort);
+
+  $("histMarcaExport").onclick = ()=> downloadCSV("historico_marcas_detalle.csv", cols, filtered);
+}
+
+/* ===================== EVENTS ===================== */
+function bindDetailEvents(){
+  const rerender = ()=> { state.detail.page = 1; renderDetail(); };
+  $("warehouseSelect").addEventListener("change", rerender);
+  $("classSelect").addEventListener("change", rerender);
+  $("searchInput").addEventListener("input", rerender);
+  $("onlyInvToggle").addEventListener("change", rerender);
+  $("covMin").addEventListener("input", rerender);
+  $("covMax").addEventListener("input", rerender);
+  $("onlySinMovInv").addEventListener("change", rerender);
+  $("onlyABZero").addEventListener("change", rerender);
+
+  $("detailPageSize").addEventListener("change", ()=>{ state.detail.page=1; renderDetail(); });
+  $("detailPrev").addEventListener("click", ()=>{ state.detail.page--; renderDetail(); });
+  $("detailNext").addEventListener("click", ()=>{ state.detail.page++; renderDetail(); });
+}
+
+function bindFinderEvents(){
+  const rerender = ()=>{ state.finder.page=1; renderFinder(); };
+  $("finderSearch").addEventListener("input", rerender);
+  $("finderOnlyInv").addEventListener("change", rerender);
+  $("finderPageSize").addEventListener("change", ()=>{ state.finder.page=1; renderFinder(); });
+  $("finderPrev").addEventListener("click", ()=>{ state.finder.page--; renderFinder(); });
+  $("finderNext").addEventListener("click", ()=>{ state.finder.page++; renderFinder(); });
+}
+
+function bindOppEvents(){
+  $("oppBreakTarget").addEventListener("change", ()=>{ state.oppBreak.page=1; renderOppBreak(); });
+  $("oppBreakOnlyRisk").addEventListener("change", ()=>{ state.oppBreak.page=1; renderOppBreak(); });
+  $("oppBreakPageSize").addEventListener("change", ()=>{ state.oppBreak.page=1; renderOppBreak(); });
+  $("oppBreakPrev").addEventListener("click", ()=>{ state.oppBreak.page--; renderOppBreak(); });
+  $("oppBreakNext").addEventListener("click", ()=>{ state.oppBreak.page++; renderOppBreak(); });
+
+  $("oppOverTarget").addEventListener("change", ()=>{ state.oppOver.page=1; renderOppOver(); });
+  $("oppOverOnlyOver").addEventListener("change", ()=>{ state.oppOver.page=1; renderOppOver(); });
+  $("oppOverPageSize").addEventListener("change", ()=>{ state.oppOver.page=1; renderOppOver(); });
+  $("oppOverPrev").addEventListener("click", ()=>{ state.oppOver.page--; renderOppOver(); });
+  $("oppOverNext").addEventListener("click", ()=>{ state.oppOver.page++; renderOppOver(); });
+}
+
+function bindHistEvents(){
+  const rerC = ()=>{ state.histCategUI.page=1; renderHistCateg(); };
+  $("histCategSucursal").addEventListener("change", rerC);
+  $("histCategSearch").addEventListener("input", rerC);
+  $("histCategFrom").addEventListener("input", rerC);
+  $("histCategTo").addEventListener("input", rerC);
+  $("histCategPageSize").addEventListener("change", ()=>{ state.histCategUI.page=1; renderHistCateg(); });
+  $("histCategPrev").addEventListener("click", ()=>{ state.histCategUI.page--; renderHistCateg(); });
+  $("histCategNext").addEventListener("click", ()=>{ state.histCategUI.page++; renderHistCateg(); });
+
+  const rerM = ()=>{ state.histMarcaUI.page=1; renderHistMarca(); };
+  $("histMarcaSucursal").addEventListener("change", rerM);
+  $("histMarcaSearch").addEventListener("input", rerM);
+  $("histMarcaFrom").addEventListener("input", rerM);
+  $("histMarcaTo").addEventListener("input", rerM);
+  $("histMarcaPageSize").addEventListener("change", ()=>{ state.histMarcaUI.page=1; renderHistMarca(); });
+  $("histMarcaPrev").addEventListener("click", ()=>{ state.histMarcaUI.page--; renderHistMarca(); });
+  $("histMarcaNext").addEventListener("click", ()=>{ state.histMarcaUI.page++; renderHistMarca(); });
+}
+
+function bindSummaryEvents(){
+  $("summaryWarehouseSelect").addEventListener("change", renderSummary);
+}
+
+function populateBranchSelects(){
+  // detail view
+  const ws = $("warehouseSelect");
+  ws.innerHTML = "";
+  for (const b of BRANCHES){
+    const opt = document.createElement("option");
+    opt.value = b.label;
+    opt.textContent = b.label;
+    ws.appendChild(opt);
+  }
+  ws.value = "EXPRESS"; // default (como tu screenshot) si existe
+  if (![...ws.options].some(o=>o.value==="EXPRESS")) ws.value = BRANCHES[0].label;
+
+  // summary executive selector
+  const ss = $("summaryWarehouseSelect");
+  // keep first "Todas"
+  for (const b of BRANCHES){
+    const opt = document.createElement("option");
+    opt.value = b.label;
+    opt.textContent = b.label;
+    ss.appendChild(opt);
+  }
+  ss.value = "ALL";
+
+  // opp selects
+  const fill = (sel)=>{
+    sel.innerHTML = "";
+    for (const b of BRANCHES){
+      const opt = document.createElement("option");
+      opt.value = b.label;
+      opt.textContent = b.label;
+      sel.appendChild(opt);
+    }
+    sel.value = BRANCHES[0].label;
+  };
+  fill($("oppBreakTarget"));
+  fill($("oppOverTarget"));
+
+  // hist selects
+  const fillHist = (sel)=>{
+    // keep ALL
+    for (const b of BRANCHES){
+      const opt = document.createElement("option");
+      opt.value = b.label;
+      opt.textContent = b.label;
+      sel.appendChild(opt);
+    }
+    sel.value = "ALL";
+  };
+  fillHist($("histCategSucursal"));
+  fillHist($("histMarcaSucursal"));
+}
+
+function clearAll(){
+  state.loaded = false;
+  state.fileName = null;
+  state.outputRows = [];
+  state.histCateg = [];
+  state.histMarca = [];
+  state.monthsUsed = 0;
+
+  setStatus("Carga un archivo para comenzar.", "");
+  enableUI(false);
+
+  destroyChart(state.charts.stacked);
+  destroyChart(state.charts.riskOver);
+  destroyChart(state.charts.dist);
+  state.charts.stacked = null;
+  state.charts.riskOver = null;
+  state.charts.dist = null;
+
+  setActiveTab("tabSummary","summaryView");
+}
+
+/* ===================== FILE LOAD ===================== */
+async function handleFile(file){
+  if (!file) return;
+
+  setStatus("Procesando archivo…", "Leyendo XLSX/CSV localmente.");
+  const t0 = performance.now();
+
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type:"array", cellDates:true });
+
+  const outName = findSheetName(wb, SHEET_OUTPUT);
+  const categName = findSheetName(wb, SHEET_CATEG);
+  const marcaName = findSheetName(wb, SHEET_MARCA);
+
+  if (!outName){
+    setStatus("ERROR: No encontré la hoja OUTPUT.", "Asegúrate que tu archivo tenga una pestaña llamada OUTPUT.");
+    return;
+  }
+
+  const outputRaw = sheetToRows(wb, outName);
+  const parsed = parseOutput(outputRaw);
+
+  state.outputRows = parsed.rows;
+  state.monthsUsed = parsed.monthsUsed;
+
+  // Históricos (si existen)
+  if (categName){
+    state.histCateg = parseHist(sheetToRows(wb, categName), "CATEG");
+  } else {
+    state.histCateg = [];
+  }
+  if (marcaName){
+    state.histMarca = parseHist(sheetToRows(wb, marcaName), "MARCA");
+  } else {
+    state.histMarca = [];
+  }
+
+  state.loaded = true;
+  state.fileName = file.name;
+
+  const t1 = performance.now();
+  const meta = [
+    `Archivo: ${file.name}`,
+    `SKUs: ${formatInt(state.outputRows.length)}`,
+    `Hojas: ${outName}${categName?`, ${categName}`:""}${marcaName?`, ${marcaName}`:""}`,
+    `Tiempo: ${formatNoDecimals((t1-t0)/1000)}s`
+  ].join(" • ");
+
+  setStatus("✅ Archivo cargado correctamente", `Sucursales detectadas: ${BRANCHES.map(b=>b.key.replace("_"," ")).join(", ")} • ${meta}`);
+
+  enableUI(true);
+  populateBranchSelects();
+
+  // default renders
+  renderSummary();
+  renderDetail();
+  renderFinder();
+  renderOppBreak();
+  renderOppOver();
+  renderHistCateg();
+  renderHistMarca();
+}
+
+/* ===================== INIT ===================== */
+function init(){
+  bindTabs();
+  bindDetailEvents();
+  bindFinderEvents();
+  bindOppEvents();
+  bindHistEvents();
+  bindSummaryEvents();
+
+  $("fileInput").addEventListener("change", (e)=>{
+    const file = e.target.files && e.target.files[0];
+    if (file) handleFile(file);
+  });
+
+  $("btnClear").addEventListener("click", ()=>{
+    $("fileInput").value = "";
+    clearAll();
+  });
+
+  clearAll();
+}
+
+document.addEventListener("DOMContentLoaded", init);
